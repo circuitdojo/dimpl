@@ -94,6 +94,7 @@ impl ExtensionType {
     pub const PostHandshakeAuth: Self = Self(0x0031);
     pub const SignatureAlgorithmsCert: Self = Self(0x0032);
     pub const KeyShare: Self = Self(0x0033);
+    pub const ConnectionId: Self = Self(0x0036);
     pub const RenegotiationInfo: Self = Self(0xFF01);
 
     pub const fn from_u16(value: u16) -> Self {
@@ -107,7 +108,7 @@ impl ExtensionType {
     const fn is_unknown(&self) -> bool {
         !matches!(
             *self,
-            Self(0x0000..=0x0019 | 0x0023 | 0x0029..=0x002D | 0x002F..=0x0033 | 0xFF01)
+            Self(0x0000..=0x0019 | 0x0023 | 0x0029..=0x002D | 0x002F..=0x0033 | 0x0036 | 0xFF01)
         )
     }
 
@@ -122,7 +123,7 @@ impl ExtensionType {
     }
 
     /// Supported extension types that this implementation handles.
-    pub const fn supported() -> &'static [ExtensionType; 8] {
+    pub const fn supported() -> &'static [ExtensionType; 9] {
         &[
             ExtensionType::SupportedGroups,
             ExtensionType::EcPointFormats,
@@ -132,6 +133,7 @@ impl ExtensionType {
             ExtensionType::ExtendedMasterSecret,
             ExtensionType::RenegotiationInfo,
             ExtensionType::SessionTicket,
+            ExtensionType::ConnectionId,
         ]
     }
 }
@@ -182,6 +184,7 @@ impl fmt::Debug for ExtensionType {
             ExtensionType::PostHandshakeAuth => "PostHandshakeAuth",
             ExtensionType::SignatureAlgorithmsCert => "SignatureAlgorithmsCert",
             ExtensionType::KeyShare => "KeyShare",
+            ExtensionType::ConnectionId => "ConnectionId",
             ExtensionType::RenegotiationInfo => "RenegotiationInfo",
             _ => unreachable!("known DTLS 1.2 extension type missing Debug label"),
         };

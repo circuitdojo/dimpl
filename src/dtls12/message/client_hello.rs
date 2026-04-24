@@ -1,5 +1,6 @@
-use super::extensions::{ECPointFormatsExtension, SignatureAlgorithmsExtension};
-use super::extensions::{SupportedGroupsExtension, UseSrtpExtension};
+use super::extensions::UseSrtpExtension;
+use super::extensions::{ConnectionIdExtension, ECPointFormatsExtension};
+use super::extensions::{SignatureAlgorithmsExtension, SupportedGroupsExtension};
 use super::{CipherSuiteVec, CompressionMethod, CompressionMethodVec, Dtls12CipherSuite};
 use super::{Cookie, Extension, ExtensionType, ProtocolVersion, Random, SessionId};
 use arrayvec::ArrayVec;
@@ -50,7 +51,7 @@ impl ClientHello {
         buf.clear();
 
         // First write all extension data
-        let mut ranges = ArrayVec::<(ExtensionType, usize, usize), 8>::new();
+        let mut ranges = ArrayVec::<(ExtensionType, usize, usize), 9>::new();
 
         // Check if provider has ECDH support
         let has_ecdh = config.crypto_provider().has_ecdh();
@@ -108,6 +109,13 @@ impl ClientHello {
             start_pos,
             start_pos, // No data at all
         ));
+
+        // Connection ID (RFC 9146)
+        if let Some(cid) = config.connection_id() {
+            let start_pos = buf.len();
+            ConnectionIdExtension::new(cid).serialize(buf);
+            ranges.push((ExtensionType::ConnectionId, start_pos, buf.len()));
+        }
 
         // Now create all extensions using ranges
         for (extension_type, start, end) in ranges {
@@ -188,16 +196,43 @@ impl ClientHello {
         let consumed = extensions_data.as_ptr() as usize - original_input.as_ptr() as usize;
         let data_base_offset = base_offset + consumed;
 
-        // Parse individual extensions, filtering to only known types
+        // Parse individual extensions, filtering to only known types.
+        // RFC 5246 §7.4.1.4: "There MUST NOT be more than one extension of
+        // the same type." The rule is not limited to extension types this
+        // implementation understands, so we track every raw u16 codepoint
+        // seen, reject duplicates regardless of support, then store only
+        // supported extensions in `ExtensionVec`. Capacity overflow on
+        // the supported set maps to a parse error instead of a panic.
         let mut extensions_rest = extensions_data;
         let mut current_offset = data_base_offset;
+        let mut seen_types: ArrayVec<u16, 64> = ArrayVec::new();
         while !extensions_rest.is_empty() {
             let before_len = extensions_rest.len();
             let (rest, extension) = Extension::parse(extensions_rest, current_offset)?;
             let parsed_len = before_len - rest.len();
             current_offset += parsed_len;
 
-            // Only keep supported extension types
+            let ty = extension.extension_type.as_u16();
+            if seen_types.contains(&ty) {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    extensions_rest,
+                    nom::error::ErrorKind::Verify,
+                )));
+            }
+            // Fail closed on tracker overflow: a silent drop here would
+            // allow an attacker to arrange 64 distinct codepoints and
+            // then smuggle a duplicate past `contains` — bypassing
+            // RFC 5246 §7.4.1.4 and, crucially, the CH1/CH2 CID
+            // equality check the HVR cookie binding provides. 64
+            // min-size extensions cost 256 bytes, well inside a single
+            // ClientHello.
+            seen_types.try_push(ty).map_err(|_| {
+                nom::Err::Failure(nom::error::Error::new(
+                    extensions_rest,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
+
             if extension.extension_type.is_supported() {
                 if extensions
                     .iter()
@@ -343,9 +378,9 @@ mod tests {
                 matches!(
                     result,
                     Err(nom::Err::Failure(error))
-                        if error.code == nom::error::ErrorKind::LengthValue
+                        if error.code == nom::error::ErrorKind::Verify
                 ),
-                "duplicate supported extensions should fail with LengthValue"
+                "duplicate supported extensions should fail with Verify"
             );
         }
     }

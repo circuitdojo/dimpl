@@ -422,6 +422,8 @@ impl ContentType {
     pub const Handshake: Self = Self(22);
     /// Application data.
     pub const ApplicationData: Self = Self(23);
+    /// Connection ID record (DTLS 1.2 only, RFC 9146).
+    pub const Tls12Cid: Self = Self(25);
     /// ACK (DTLS 1.3 only, RFC 9147 Section 7).
     pub const Ack: Self = Self(26);
 
@@ -437,7 +439,7 @@ impl ContentType {
 
     /// Returns true if this is not a known DTLS record content type.
     pub const fn is_unknown(&self) -> bool {
-        !matches!(*self, Self(20..=23 | 26))
+        !matches!(*self, Self(20..=23 | 25 | 26))
     }
 
     /// Parse a `ContentType` from wire format.
@@ -454,6 +456,7 @@ impl fmt::Debug for ContentType {
             ContentType::Alert => f.write_str("Alert"),
             ContentType::Handshake => f.write_str("Handshake"),
             ContentType::ApplicationData => f.write_str("ApplicationData"),
+            ContentType::Tls12Cid => f.write_str("Tls12Cid"),
             ContentType::Ack => f.write_str("Ack"),
             _ => f.debug_tuple("Unknown").field(&self.0).finish(),
         }

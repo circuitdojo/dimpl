@@ -63,6 +63,36 @@ pub enum Error {
     /// value to communicate from dtls13/server.rs to lib.rs.
     #[doc(hidden)]
     Dtls12Fallback,
+    /// Application data exceeds the DTLS record-size ceiling.
+    ///
+    /// RFC 6347 §4.1.1 / RFC 9146 §5 cap `DTLSPlaintext` /
+    /// `DTLSInnerPlaintext` at `2^14` bytes. Callers must fragment larger
+    /// payloads before calling `send_application_data`.
+    Oversized(usize),
+    /// Configured MTU is too small to hold even a single record header plus
+    /// a handshake-header byte of body. Encountered when negotiated CID
+    /// bytes + AEAD overhead + handshake/record headers already fill or
+    /// exceed `Config::mtu()`. Terminal for this association: the caller
+    /// must either raise MTU or renegotiate with a shorter peer CID
+    /// (dimpl rejects renegotiation, so in practice the association
+    /// cannot make handshake progress).
+    MtuTooSmall {
+        /// Overhead bytes consumed by headers + CID + AEAD + handshake.
+        overhead: usize,
+        /// Configured MTU as reported by `Config::mtu()`.
+        mtu: usize,
+    },
+    /// DTLS 1.2 sequence-number space is exhausted for this epoch.
+    ///
+    /// RFC 6347 §4.1: implementations MUST abandon the association or
+    /// rehandshake before the 48-bit wire sequence number wraps. dimpl
+    /// does not implement renegotiation or rekey, so this is terminal.
+    SequenceNumberExhausted {
+        /// The epoch whose sequence space is exhausted.
+        epoch: u16,
+        /// The next sequence number that would have been emitted.
+        sequence: u64,
+    },
 }
 
 /// Fine-grained reason for an [`Error::UnexpectedMessage`].
@@ -508,6 +538,10 @@ pub enum SecurityError {
         /// The DTLS alert description.
         description: u8,
     },
+    /// The peer sent a connection_id extension we did not solicit.
+    UnsolicitedConnectionIdExtension,
+    /// A connection_id extension could not be parsed.
+    MalformedConnectionIdExtension,
 }
 
 /// Fine-grained reason for an [`Error::PskError`].
@@ -555,6 +589,16 @@ pub enum ConfigError {
     NoDtls12KeyExchangeGroupsAfterFiltering,
     /// DTLS 1.3 suites are enabled but no key exchange group remains enabled.
     NoDtls13KeyExchangeGroupsAfterFiltering,
+    /// The configured connection ID exceeds the RFC 9146 maximum length.
+    ConnectionIdTooLong {
+        /// The configured connection ID length.
+        len: usize,
+        /// The maximum accepted length.
+        max: usize,
+    },
+    /// Connection ID (RFC 9146, DTLS 1.2) is configured but cipher-suite
+    /// filtering removed every DTLS 1.2 suite.
+    ConnectionIdWithoutDtls12CipherSuite,
     /// Crypto provider validation failed.
     CryptoProvider(CryptoProviderValidationError),
 }
@@ -787,6 +831,27 @@ impl fmt::Display for Error {
             Error::TooManyClientHelloFragments => write!(f, "too many client hello fragments"),
             Error::ConnectionClosed => write!(f, "connection closed"),
             Error::Dtls12Fallback => write!(f, "dtls 1.2 fallback (internal)"),
+            Error::Oversized(n) => {
+                write!(
+                    f,
+                    "payload {} bytes exceeds DTLS record-size ceiling (16384)",
+                    n
+                )
+            }
+            Error::MtuTooSmall { overhead, mtu } => {
+                write!(
+                    f,
+                    "MTU {} cannot fit DTLS record overhead of {} bytes",
+                    mtu, overhead
+                )
+            }
+            Error::SequenceNumberExhausted { epoch, sequence } => {
+                write!(
+                    f,
+                    "DTLS 1.2 sequence number exhausted (epoch={}, seq={})",
+                    epoch, sequence
+                )
+            }
         }
     }
 }
@@ -1196,6 +1261,12 @@ impl fmt::Display for SecurityError {
             Self::FatalAlert { description } => {
                 write!(f, "received fatal alert: description={description}")
             }
+            Self::UnsolicitedConnectionIdExtension => {
+                write!(f, "peer sent unsolicited connection_id extension")
+            }
+            Self::MalformedConnectionIdExtension => {
+                write!(f, "malformed connection_id extension")
+            }
         }
     }
 }
@@ -1226,6 +1297,17 @@ impl fmt::Display for ConfigError {
             Self::MtuTooSmall { mtu, minimum } => {
                 write!(f, "MTU {mtu} is too small (minimum {minimum})")
             }
+            Self::ConnectionIdTooLong { len, max } => {
+                write!(f, "connection ID length {len} exceeds maximum {max}")
+            }
+            Self::ConnectionIdWithoutDtls12CipherSuite => write!(
+                f,
+                concat!(
+                    "connection ID is configured (RFC 9146, DTLS 1.2) but no DTLS 1.2 ",
+                    "cipher suite survives the filter; either include a DTLS 1.2 suite ",
+                    "in `dtls12_cipher_suites` or drop `with_connection_id`"
+                )
+            ),
             Self::AeadEncryptionLimitTooSmall => {
                 write!(f, "aead_encryption_limit must be at least 1")
             }

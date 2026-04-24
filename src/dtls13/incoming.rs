@@ -6,6 +6,7 @@ use std::fmt;
 
 use crate::buffer::{Buf, TmpBuf};
 use crate::dtls13::message::{ContentType, Dtls13CipherSuite, Dtls13Record, Handshake, Sequence};
+use crate::util::recover_inner_content_type;
 use crate::{Error, InternalError};
 
 /// Holds both the UDP packet and the parsed result of that packet.
@@ -458,26 +459,6 @@ fn parse_handshakes(
         }
     }
     handshakes
-}
-
-/// Recover the inner content type from a decrypted DTLSInnerPlaintext.
-///
-/// The format is: `content || ContentType || zeros*`
-/// Scan backward past zero padding to find the content type byte.
-fn recover_inner_content_type(decrypted: &[u8]) -> Result<(ContentType, usize), InternalError> {
-    let mut i = decrypted.len();
-    // Skip zero padding
-    while i > 0 && decrypted[i - 1] == 0 {
-        i -= 1;
-    }
-    if i == 0 {
-        return Err(InternalError::parse(nom::error::ErrorKind::Fail));
-    }
-    // The byte before padding is the content type
-    i -= 1;
-    let content_type = ContentType::from_u8(decrypted[i]);
-    // Content length is everything before the content type byte
-    Ok((content_type, i))
 }
 
 impl fmt::Debug for Incoming {
