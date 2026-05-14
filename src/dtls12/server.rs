@@ -25,11 +25,11 @@ use crate::dtls12::Client;
 use crate::dtls12::client::LocalEvent;
 use crate::dtls12::context::AuthMode;
 use crate::dtls12::engine::Engine;
-use crate::dtls12::message::PskParams;
 use crate::dtls12::message::{Body, CertificateRequest, CertificateTypeVec, Dtls12CipherSuite};
 use crate::dtls12::message::{ClientCertificateType, CompressionMethod, ContentType};
 use crate::dtls12::message::{ClientHello, ConnectionIdExtension, SrtpProfileVec};
 use crate::dtls12::message::{Cookie, CurveType, DistinguishedName, ExchangeKeys, ExtensionType};
+use crate::dtls12::message::{EcdhePskServerParams, PskParams};
 use crate::dtls12::message::{HashAlgorithm, HelloVerifyRequest, KeyExchangeAlgorithm};
 use crate::dtls12::message::{MessageType, NamedGroup, NamedGroupVec, ProtocolVersion, Random};
 use crate::dtls12::message::{ServerHello, SessionId, SignatureAlgorithm};
@@ -592,8 +592,8 @@ impl State {
             .cipher_suite()
             .ok_or_else(|| Error::UnexpectedMessage("No cipher suite selected".to_string()))?;
 
-        // PSK suites skip Certificate
-        if cs.is_psk() {
+        // PSK and ECDHE-PSK suites skip Certificate (PSK authenticates).
+        if cs.skips_certificate() {
             Ok(Self::SendServerKeyExchange)
         } else {
             Ok(Self::SendCertificate)
@@ -618,8 +618,17 @@ impl State {
             .cipher_suite()
             .ok_or_else(|| Error::UnexpectedMessage("No cipher suite selected".to_string()))?;
 
-        if cs.is_psk() {
-            return self.send_server_key_exchange_psk(server);
+        match cs.as_key_exchange_algorithm() {
+            KeyExchangeAlgorithm::PSK => return self.send_server_key_exchange_psk(server),
+            KeyExchangeAlgorithm::ECDHE_PSK => {
+                return self.send_server_key_exchange_ecdhe_psk(server);
+            }
+            KeyExchangeAlgorithm::EECDH => {}
+            KeyExchangeAlgorithm::Unknown => {
+                return Err(Error::SecurityError(
+                    "Unknown key exchange algorithm".to_string(),
+                ));
+            }
         }
 
         let client_random = server
@@ -723,6 +732,71 @@ impl State {
         Ok(Self::SendServerHelloDone)
     }
 
+    /// Hybrid ECDHE-PSK ServerKeyExchange (RFC 5489 §2): hint + ServerECDHParams.
+    /// No signature trailer — PSK authenticates the server via the Finished MAC.
+    fn send_server_key_exchange_ecdhe_psk(self, server: &mut Server) -> Result<Self, Error> {
+        let allowed_named_groups: Vec<NamedGroup> = server
+            .engine
+            .config()
+            .kx_groups()
+            .map(|g| g.name())
+            .collect();
+        let selected_named_group = select_named_group(
+            server.client_supported_groups.as_ref(),
+            &allowed_named_groups,
+        )
+        .ok_or_else(|| {
+            if server.client_supported_groups.is_some() {
+                Error::SecurityError(
+                    "No common DTLS 1.2 key exchange group between client supported_groups \
+                     and server configuration"
+                        .into(),
+                )
+            } else {
+                Error::CryptoError("No DTLS 1.2 key exchange groups configured".into())
+            }
+        })?;
+
+        let hint = server
+            .engine
+            .config()
+            .psk_identity_hint()
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
+
+        debug!(
+            "ECDHE-PSK SKE: hint={} bytes, group={:?}",
+            hint.len(),
+            selected_named_group
+        );
+
+        server
+            .engine
+            .create_handshake(MessageType::ServerKeyExchange, move |body, engine| {
+                let mut kx_buf = engine.pop_buffer();
+                let pubkey = engine
+                    .crypto_context_mut()
+                    .init_ecdh_server(selected_named_group, &mut kx_buf)
+                    .map_err(|e| {
+                        Error::CryptoError(format!("Failed to init ECDHE-PSK SKE: {}", e))
+                    })?
+                    .to_vec();
+                engine.push_buffer(kx_buf);
+
+                EcdhePskServerParams::serialize_from_bytes(
+                    &hint,
+                    CurveType::NamedCurve,
+                    selected_named_group,
+                    &pubkey,
+                    body,
+                );
+                Ok(())
+            })?;
+
+        // ECDHE-PSK never sends CertificateRequest (no client cert path).
+        Ok(Self::SendServerHelloDone)
+    }
+
     fn send_certificate_request(self, server: &mut Server) -> Result<Self, Error> {
         debug!("Sending CertificateRequest");
         // Select CertificateRequest.signature_algorithms as intersection of client's list and our supported
@@ -754,8 +828,8 @@ impl State {
             .cipher_suite()
             .ok_or_else(|| Error::UnexpectedMessage("No cipher suite selected".to_string()))?;
 
-        // PSK: no client certificates
-        if cs.is_psk() {
+        // PSK and ECDHE-PSK: no client certificates (PSK authenticates).
+        if cs.skips_certificate() {
             return Ok(Self::AwaitClientKeyExchange);
         }
 
@@ -833,74 +907,151 @@ impl State {
             .cipher_suite()
             .ok_or_else(|| Error::UnexpectedMessage("No cipher suite selected".to_string()))?;
 
-        if suite.is_psk() {
-            // Extract PSK identity range before dropping handshake
-            let identity_range = match &ckx.exchange_keys {
-                ExchangeKeys::Psk(keys) => keys.identity_range.clone(),
-                _ => {
-                    return Err(Error::UnexpectedMessage(
-                        "ECDHE ClientKeyExchange in PSK path".to_string(),
-                    ));
-                }
-            };
+        match suite.as_key_exchange_algorithm() {
+            KeyExchangeAlgorithm::PSK => {
+                // Extract PSK identity range before dropping handshake
+                let identity_range = match &ckx.exchange_keys {
+                    ExchangeKeys::Psk(keys) => keys.identity_range.clone(),
+                    _ => {
+                        return Err(Error::UnexpectedMessage(
+                            "Non-PSK ClientKeyExchange in PSK path".to_string(),
+                        ));
+                    }
+                };
 
-            drop(maybe);
+                drop(maybe);
 
-            let identity = &server.defragment_buffer[identity_range];
-            trace!("PSK identity ({} bytes)", identity.len());
+                let identity = &server.defragment_buffer[identity_range];
+                trace!("PSK identity ({} bytes)", identity.len());
 
-            // Resolve PSK via the configured resolver. On failure we derive a
-            // random dummy of fixed length so the handshake proceeds identically
-            // to a valid-identity flow (no timing oracle) and the Finished MAC
-            // is guaranteed to mismatch — not merely likely to.
-            let resolved = server
-                .engine
-                .config()
-                .psk_resolver()
-                .ok_or_else(|| Error::PskError("No PSK resolver configured".to_string()))?
-                .resolve(identity);
+                // Resolve PSK via the configured resolver. On failure we derive a
+                // random dummy of fixed length so the handshake proceeds identically
+                // to a valid-identity flow (no timing oracle) and the Finished MAC
+                // is guaranteed to mismatch — not merely likely to.
+                let resolved = server
+                    .engine
+                    .config()
+                    .psk_resolver()
+                    .ok_or_else(|| Error::PskError("No PSK resolver configured".to_string()))?
+                    .resolve(identity);
 
-            let (psk, psk_valid) = match resolved {
-                Some(key) => (key, true),
-                None => {
-                    let dummy: [u8; DUMMY_PSK_LEN] = server.engine.rng.random();
-                    (dummy.to_vec(), false)
-                }
-            };
+                let (psk, psk_valid) = match resolved {
+                    Some(key) => (key, true),
+                    None => {
+                        let dummy: [u8; DUMMY_PSK_LEN] = server.engine.rng.random();
+                        (dummy.to_vec(), false)
+                    }
+                };
 
-            server.psk_valid = Some(psk_valid);
+                server.psk_valid = Some(psk_valid);
 
-            let crypto = server.engine.crypto_context_mut();
-            crypto.set_psk(psk);
-            crypto
-                .compute_psk_pre_master_secret()
-                .map_err(|e| Error::CryptoError(format!("Failed to compute PSK PMS: {}", e)))?;
-        } else {
-            // Extract client's public key range before dropping handshake
-            let public_key_range = match &ckx.exchange_keys {
-                ExchangeKeys::Ecdh(keys) => keys.public_key_range.clone(),
-                ExchangeKeys::Psk(_) => {
-                    return Err(Error::UnexpectedMessage(
-                        "PSK ClientKeyExchange in ECDHE path".to_string(),
-                    ));
-                }
-            };
+                let crypto = server.engine.crypto_context_mut();
+                crypto.set_psk(psk);
+                crypto
+                    .compute_psk_pre_master_secret()
+                    .map_err(|e| Error::CryptoError(format!("Failed to compute PSK PMS: {}", e)))?;
+            }
+            KeyExchangeAlgorithm::ECDHE_PSK => {
+                // Extract identity AND ECDH public key ranges (RFC 5489 §2).
+                let (identity_range, public_key_range) = match &ckx.exchange_keys {
+                    ExchangeKeys::EcdhePsk(keys) => {
+                        (keys.identity_range.clone(), keys.public_key_range.clone())
+                    }
+                    _ => {
+                        return Err(Error::UnexpectedMessage(
+                            "Non-ECDHE-PSK ClientKeyExchange in ECDHE-PSK path".to_string(),
+                        ));
+                    }
+                };
 
-            drop(maybe);
+                drop(maybe);
 
-            // Get the actual public key data from defragment_buffer
-            let client_pub = &server.defragment_buffer[public_key_range];
+                let identity = server.defragment_buffer[identity_range].to_vec();
+                let client_pub = server.defragment_buffer[public_key_range].to_vec();
+                trace!(
+                    "ECDHE-PSK CKE: identity={} bytes, pubkey={} bytes",
+                    identity.len(),
+                    client_pub.len()
+                );
 
-            // Compute shared secret
-            let mut buf = server.engine.pop_buffer();
-            server
-                .engine
-                .crypto_context_mut()
-                .compute_shared_secret(client_pub, &mut buf)
-                .map_err(|e| {
-                    Error::CryptoError(format!("Failed to compute shared secret: {}", e))
+                // Substitute a random dummy on identity-miss so the handshake
+                // advances identically to a valid-identity flow (no timing
+                // oracle) and the Finished MAC mismatches deterministically.
+                let resolved = server
+                    .engine
+                    .config()
+                    .psk_resolver()
+                    .ok_or_else(|| Error::PskError("No PSK resolver configured".to_string()))?
+                    .resolve(&identity);
+
+                let (psk, psk_valid) = match resolved {
+                    Some(key) => (key, true),
+                    None => {
+                        let dummy: [u8; DUMMY_PSK_LEN] = server.engine.rng.random();
+                        (dummy.to_vec(), false)
+                    }
+                };
+
+                server.psk_valid = Some(psk_valid);
+
+                // Compute the ECDHE shared secret `Z` — this stores Z in
+                // pre_master_secret. Then fold the PSK in per RFC 5489 §2.
+                let mut buf = server.engine.pop_buffer();
+                let crypto = server.engine.crypto_context_mut();
+                crypto.set_psk(psk);
+                crypto
+                    .compute_shared_secret(&client_pub, &mut buf)
+                    .map_err(|e| {
+                        Error::CryptoError(format!(
+                            "Failed to compute ECDHE-PSK shared secret: {}",
+                            e
+                        ))
+                    })?;
+                crypto.wrap_ecdhe_psk_pre_master_secret().map_err(|e| {
+                    Error::CryptoError(format!(
+                        "Failed to construct ECDHE-PSK pre-master secret: {}",
+                        e
+                    ))
                 })?;
-            server.engine.push_buffer(buf);
+                server.engine.push_buffer(buf);
+            }
+            KeyExchangeAlgorithm::EECDH => {
+                // Extract client's public key range before dropping handshake
+                let public_key_range = match &ckx.exchange_keys {
+                    ExchangeKeys::Ecdh(keys) => keys.public_key_range.clone(),
+                    ExchangeKeys::Psk(_) => {
+                        return Err(Error::UnexpectedMessage(
+                            "PSK ClientKeyExchange in ECDHE path".to_string(),
+                        ));
+                    }
+                    ExchangeKeys::EcdhePsk(_) => {
+                        return Err(Error::UnexpectedMessage(
+                            "ECDHE-PSK ClientKeyExchange in ECDHE-ECDSA path".to_string(),
+                        ));
+                    }
+                };
+
+                drop(maybe);
+
+                // Get the actual public key data from defragment_buffer
+                let client_pub = &server.defragment_buffer[public_key_range];
+
+                // Compute shared secret
+                let mut buf = server.engine.pop_buffer();
+                server
+                    .engine
+                    .crypto_context_mut()
+                    .compute_shared_secret(client_pub, &mut buf)
+                    .map_err(|e| {
+                        Error::CryptoError(format!("Failed to compute shared secret: {}", e))
+                    })?;
+                server.engine.push_buffer(buf);
+            }
+            KeyExchangeAlgorithm::Unknown => {
+                return Err(Error::SecurityError(
+                    "Unknown key exchange algorithm".to_string(),
+                ));
+            }
         }
 
         // Capture session hash for EMS now (up to ClientKeyExchange)
@@ -1092,10 +1243,14 @@ impl State {
         // because a silent bypass could let a forged-PSK Finished through.
         // Loosen when dtls-conn-id lands and abbreviated handshakes legitimately
         // skip ClientKeyExchange (reusing a cached master secret).
-        if server.engine.cipher_suite().is_some_and(|cs| cs.is_psk()) {
+        if server
+            .engine
+            .cipher_suite()
+            .is_some_and(|cs| cs.skips_certificate())
+        {
             assert!(
                 server.psk_valid.is_some(),
-                "PSK handshake reached Finished without processing ClientKeyExchange"
+                "PSK / ECDHE-PSK handshake reached Finished without processing ClientKeyExchange"
             );
         }
 

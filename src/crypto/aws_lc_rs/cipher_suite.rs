@@ -232,6 +232,41 @@ impl SupportedDtls12CipherSuite for ChaCha20Poly1305Sha256 {
     }
 }
 
+/// TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256 cipher suite (0xCCAC, RFC 7905).
+///
+/// Hybrid ECDHE + PSK key exchange (RFC 5489 §2) with ChaCha20-Poly1305 AEAD
+/// record protection. Record protection reuses `ChaCha20Poly1305Cipher`; only
+/// the handshake key-exchange messages and pre-master construction differ
+/// from `ECDHE_ECDSA_CHACHA20_POLY1305_SHA256`.
+#[derive(Debug)]
+struct EcdhePskChaCha20Poly1305Sha256;
+
+impl SupportedDtls12CipherSuite for EcdhePskChaCha20Poly1305Sha256 {
+    fn suite(&self) -> Dtls12CipherSuite {
+        Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256
+    }
+
+    fn hash_algorithm(&self) -> HashAlgorithm {
+        HashAlgorithm::SHA256
+    }
+
+    fn key_lengths(&self) -> (usize, usize, usize) {
+        (0, 32, 12) // (mac_key_len, enc_key_len, fixed_iv_len) — AEAD ChaCha20
+    }
+
+    fn explicit_nonce_len(&self) -> usize {
+        0
+    }
+
+    fn tag_len(&self) -> usize {
+        16
+    }
+
+    fn create_cipher(&self, key: &[u8]) -> Result<Box<dyn Cipher>, String> {
+        Ok(Box::new(ChaCha20Poly1305Cipher::new(key)?))
+    }
+}
+
 /// TLS_PSK_WITH_AES_128_CCM_8 cipher suite.
 #[derive(Debug)]
 struct PskAes128Ccm8;
@@ -268,6 +303,8 @@ impl SupportedDtls12CipherSuite for PskAes128Ccm8 {
 static AES_128_GCM_SHA256: Aes128GcmSha256 = Aes128GcmSha256;
 static AES_256_GCM_SHA384: Aes256GcmSha384 = Aes256GcmSha384;
 static CHACHA20_POLY1305_SHA256: ChaCha20Poly1305Sha256 = ChaCha20Poly1305Sha256;
+static ECDHE_PSK_CHACHA20_POLY1305_SHA256: EcdhePskChaCha20Poly1305Sha256 =
+    EcdhePskChaCha20Poly1305Sha256;
 static PSK_AES_128_CCM_8: PskAes128Ccm8 = PskAes128Ccm8;
 
 /// All supported DTLS 1.2 cipher suites.
@@ -275,6 +312,7 @@ pub(super) static ALL_CIPHER_SUITES: &[&dyn SupportedDtls12CipherSuite] = &[
     &AES_128_GCM_SHA256,
     &AES_256_GCM_SHA384,
     &CHACHA20_POLY1305_SHA256,
+    &ECDHE_PSK_CHACHA20_POLY1305_SHA256,
     &PSK_AES_128_CCM_8,
 ];
 

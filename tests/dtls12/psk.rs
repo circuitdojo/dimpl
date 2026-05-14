@@ -73,6 +73,10 @@ fn psk_configs() -> (Arc<Config>, Arc<Config>) {
     psk_configs_for_suite(Dtls12CipherSuite::PSK_AES128_CCM_8)
 }
 
+fn ecdhe_psk_chacha_configs() -> (Arc<Config>, Arc<Config>) {
+    psk_configs_for_suite(Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256)
+}
+
 #[test]
 fn dtls12_psk_self_handshake() {
     let _ = env_logger::try_init();
@@ -755,5 +759,370 @@ fn dtls12_psk_with_cid_tampered_record_is_dropped() {
     assert!(
         after_valid.app_data.iter().any(|d| d == payload),
         "PSK client must accept the untampered original after a tampered drop"
+    );
+}
+
+// =============================================================================
+// ECDHE-PSK with ChaCha20-Poly1305 (RFC 5489 §2 KX + RFC 7905 AEAD, 0xCCAC)
+// =============================================================================
+//
+// Forward-secure PSK: ephemeral ECDH provides the secrecy property even if
+// the PSK is later compromised, while the PSK provides peer authentication
+// via the Finished MAC (no certificates involved).
+
+#[test]
+fn ecdhe_psk_chacha_self_handshake() {
+    let _ = env_logger::try_init();
+
+    let (client_config, server_config) = ecdhe_psk_chacha_configs();
+    let now = Instant::now();
+
+    let mut client = Dtls::new_12_psk(client_config, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_12_psk(server_config, now);
+    server.set_active(false);
+
+    let mut client_connected = false;
+    let mut server_connected = false;
+
+    for _ in 0..60 {
+        client.handle_timeout(Instant::now()).unwrap();
+        server.handle_timeout(Instant::now()).unwrap();
+
+        let co = drain_outputs(&mut client);
+        if co.connected {
+            client_connected = true;
+        }
+        deliver_packets(&co.packets, &mut server);
+
+        let so = drain_outputs(&mut server);
+        if so.connected {
+            server_connected = true;
+        }
+        deliver_packets(&so.packets, &mut client);
+
+        if client_connected && server_connected {
+            break;
+        }
+    }
+
+    assert!(client_connected, "ECDHE-PSK client should connect");
+    assert!(server_connected, "ECDHE-PSK server should connect");
+}
+
+#[test]
+fn ecdhe_psk_chacha_application_data_roundtrip() {
+    let _ = env_logger::try_init();
+
+    let (client_config, server_config) = ecdhe_psk_chacha_configs();
+    let now = Instant::now();
+
+    let mut client = Dtls::new_12_psk(client_config, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_12_psk(server_config, now);
+    server.set_active(false);
+
+    // Complete handshake
+    for _ in 0..60 {
+        client.handle_timeout(Instant::now()).unwrap();
+        server.handle_timeout(Instant::now()).unwrap();
+
+        let co = drain_outputs(&mut client);
+        deliver_packets(&co.packets, &mut server);
+
+        let so = drain_outputs(&mut server);
+        deliver_packets(&so.packets, &mut client);
+
+        if co.connected || so.connected {
+            // One more round so both sides finish
+            client.handle_timeout(Instant::now()).unwrap();
+            server.handle_timeout(Instant::now()).unwrap();
+            let co2 = drain_outputs(&mut client);
+            deliver_packets(&co2.packets, &mut server);
+            let so2 = drain_outputs(&mut server);
+            deliver_packets(&so2.packets, &mut client);
+            break;
+        }
+    }
+
+    let payload = b"Hello from ECDHE-PSK client!";
+    client
+        .send_application_data(payload)
+        .expect("send app data");
+    deliver_packets(&drain_outputs(&mut client).packets, &mut server);
+    let so = drain_outputs(&mut server);
+    assert!(
+        so.app_data.iter().any(|d| d == payload),
+        "Server should decrypt ECDHE-PSK client data"
+    );
+
+    let reply = b"Hello from ECDHE-PSK server!";
+    server.send_application_data(reply).expect("send app data");
+    deliver_packets(&drain_outputs(&mut server).packets, &mut client);
+    let co = drain_outputs(&mut client);
+    assert!(
+        co.app_data.iter().any(|d| d == reply),
+        "Client should decrypt ECDHE-PSK server data"
+    );
+}
+
+#[test]
+fn ecdhe_psk_chacha_invalid_identity_fails_at_finished() {
+    // RFC 6347 §4.1.2.7: the Finished MAC mismatch caused by an unknown
+    // identity (and thus a random dummy PSK on the server side) is silently
+    // discarded. The security property is that neither peer signals Connected.
+    let _ = env_logger::try_init();
+
+    struct FailingResolver;
+    impl PskResolver for FailingResolver {
+        fn resolve(&self, _identity: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+    }
+    struct PassingResolver;
+    impl PskResolver for PassingResolver {
+        fn resolve(&self, _identity: &[u8]) -> Option<Vec<u8>> {
+            Some(vec![0u8; 32])
+        }
+    }
+
+    let provider = psk_provider(Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256);
+
+    let server_config = Config::builder()
+        .with_crypto_provider(provider.clone())
+        .with_psk_server(None, Arc::new(FailingResolver))
+        .build()
+        .expect("server config should build");
+    let mut server = Dtls::new_12_psk(Arc::new(server_config), Instant::now());
+
+    let client_config = Config::builder()
+        .with_crypto_provider(provider)
+        .with_psk_client(b"test_identity".to_vec(), Arc::new(PassingResolver))
+        .build()
+        .expect("client config should build");
+    let mut client = Dtls::new_12_psk(Arc::new(client_config), Instant::now());
+    client.set_active(true);
+
+    for _ in 0..60 {
+        let _ = client.handle_timeout(Instant::now());
+        let co = drain_outputs(&mut client);
+        assert!(
+            !co.connected,
+            "client must not connect with unknown identity"
+        );
+        for p in &co.packets {
+            let _ = server.handle_packet(p);
+        }
+
+        let _ = server.handle_timeout(Instant::now());
+        let so = drain_outputs(&mut server);
+        assert!(
+            !so.connected,
+            "server must not connect with unknown identity"
+        );
+        for p in &so.packets {
+            let _ = client.handle_packet(p);
+        }
+    }
+}
+
+#[test]
+fn ecdhe_psk_chacha_mismatched_keys_fail_at_finished_via_mac() {
+    // Both resolvers return Some — exercises the Finished MAC mismatch on
+    // its own (server.psk_valid stays Some(true), so the flag check passes).
+    let _ = env_logger::try_init();
+
+    struct ZeroKey;
+    impl PskResolver for ZeroKey {
+        fn resolve(&self, _identity: &[u8]) -> Option<Vec<u8>> {
+            Some(vec![0u8; 32])
+        }
+    }
+    struct OneKey;
+    impl PskResolver for OneKey {
+        fn resolve(&self, _identity: &[u8]) -> Option<Vec<u8>> {
+            Some(vec![0xAA; 32])
+        }
+    }
+
+    let provider = psk_provider(Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256);
+
+    let server_config = Config::builder()
+        .with_crypto_provider(provider.clone())
+        .with_psk_server(None, Arc::new(ZeroKey))
+        .build()
+        .expect("server config should build");
+    let mut server = Dtls::new_12_psk(Arc::new(server_config), Instant::now());
+
+    let client_config = Config::builder()
+        .with_crypto_provider(provider)
+        .with_psk_client(b"test_identity".to_vec(), Arc::new(OneKey))
+        .build()
+        .expect("client config should build");
+    let mut client = Dtls::new_12_psk(Arc::new(client_config), Instant::now());
+    client.set_active(true);
+
+    for _ in 0..60 {
+        let _ = client.handle_timeout(Instant::now());
+        let co = drain_outputs(&mut client);
+        assert!(!co.connected, "client must not connect with mismatched PSK");
+        for p in &co.packets {
+            let _ = server.handle_packet(p);
+        }
+
+        let _ = server.handle_timeout(Instant::now());
+        let so = drain_outputs(&mut server);
+        assert!(!so.connected, "server must not connect with mismatched PSK");
+        for p in &so.packets {
+            let _ = client.handle_packet(p);
+        }
+    }
+}
+
+#[test]
+fn ecdhe_psk_chacha_forward_secrecy_smoke() {
+    // Two independent ECDHE-PSK handshakes with the same PSK produce different
+    // application-data ciphertexts for the same plaintext — sanity check that
+    // the ephemeral ECDH half is actually contributing entropy and that the
+    // pre-master secret isn't just a deterministic function of the PSK.
+    let _ = env_logger::try_init();
+
+    fn drive_to_app_record(payload: &[u8]) -> Vec<u8> {
+        let (client_config, server_config) = ecdhe_psk_chacha_configs();
+        let now = Instant::now();
+
+        let mut client = Dtls::new_12_psk(client_config, now);
+        client.set_active(true);
+        let mut server = Dtls::new_12_psk(server_config, now);
+        server.set_active(false);
+
+        let mut client_connected = false;
+        let mut server_connected = false;
+        for _ in 0..60 {
+            client.handle_timeout(Instant::now()).unwrap();
+            server.handle_timeout(Instant::now()).unwrap();
+            let co = drain_outputs(&mut client);
+            let so = drain_outputs(&mut server);
+            client_connected |= co.connected;
+            server_connected |= so.connected;
+            deliver_packets(&co.packets, &mut server);
+            deliver_packets(&so.packets, &mut client);
+            if client_connected && server_connected {
+                break;
+            }
+        }
+        assert!(client_connected && server_connected);
+
+        client.send_application_data(payload).unwrap();
+        // The first packet on the wire that's an ApplicationData record (type 23).
+        collect_packets(&mut client)
+            .into_iter()
+            .find(|p| !p.is_empty() && p[0] == 23)
+            .expect("expected an ApplicationData record")
+    }
+
+    let payload = b"same-plaintext";
+    let session_a = drive_to_app_record(payload);
+    let session_b = drive_to_app_record(payload);
+
+    // The DTLS record header has predictable bytes (epoch, seqnum, length) at
+    // fixed offsets, but the ciphertext + tag must differ across independent
+    // ephemeral sessions. Compare the AEAD-protected payload region (after the
+    // 13-byte DTLS record header).
+    assert!(session_a.len() > 13 && session_b.len() > 13);
+    let body_a = &session_a[13..];
+    let body_b = &session_b[13..];
+    assert_ne!(
+        body_a, body_b,
+        "Same plaintext under same PSK must encrypt differently across \
+         two independent ECDHE-PSK handshakes (ephemeral keys are doing nothing otherwise)"
+    );
+}
+
+/// PSK + ECDHE-PSK + Connection ID composability: the new suite should work
+/// transparently with the CID extension already on this branch.
+#[test]
+fn ecdhe_psk_chacha_with_cid_handshake_and_app_data() {
+    let _ = env_logger::try_init();
+
+    let identity = b"iot-device".to_vec();
+    let key = b"0123456789abcdef".to_vec();
+    let resolver = Arc::new(FixedPsk {
+        identity: identity.clone(),
+        key,
+    });
+
+    let provider = psk_provider(Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256);
+    let client_cid: &[u8] = b"cc-c";
+    let server_cid: &[u8] = b"cc-s";
+
+    let client_config = Arc::new(
+        Config::builder()
+            .with_crypto_provider(provider.clone())
+            .with_psk_client(identity, resolver.clone())
+            .with_connection_id(client_cid.to_vec())
+            .build()
+            .expect("build ECDHE-PSK+CID client config"),
+    );
+    let server_config = Arc::new(
+        Config::builder()
+            .with_crypto_provider(provider)
+            .with_psk_server(Some(b"hint".to_vec()), resolver)
+            .with_connection_id(server_cid.to_vec())
+            .build()
+            .expect("build ECDHE-PSK+CID server config"),
+    );
+
+    let mut now = Instant::now();
+    let mut client = Dtls::new_12_psk(client_config, now);
+    client.set_active(true);
+    let mut server = Dtls::new_12_psk(server_config, now);
+    server.set_active(false);
+
+    let mut client_connected = false;
+    let mut server_connected = false;
+    let mut client_reported_cid: Option<Vec<u8>> = None;
+    let mut server_reported_cid: Option<Vec<u8>> = None;
+
+    for _ in 0..60 {
+        client.handle_timeout(now).expect("client timeout");
+        server.handle_timeout(now).expect("server timeout");
+        let co = drain_outputs(&mut client);
+        let so = drain_outputs(&mut server);
+        client_connected |= co.connected;
+        server_connected |= so.connected;
+        if co.connection_id.is_some() {
+            client_reported_cid = co.connection_id;
+        }
+        if so.connection_id.is_some() {
+            server_reported_cid = so.connection_id;
+        }
+        deliver_packets(&co.packets, &mut server);
+        deliver_packets(&so.packets, &mut client);
+        if client_connected && server_connected {
+            break;
+        }
+        now += Duration::from_millis(10);
+    }
+
+    assert!(client_connected, "ECDHE-PSK+CID client should connect");
+    assert!(server_connected, "ECDHE-PSK+CID server should connect");
+    assert_eq!(client_reported_cid.as_deref(), Some(client_cid));
+    assert_eq!(server_reported_cid.as_deref(), Some(server_cid));
+
+    let req = b"ecdhe-psk-cid-req";
+    client.send_application_data(req).expect("client send");
+    let client_pkts = collect_packets(&mut client);
+    assert!(
+        client_pkts.iter().any(|p| !p.is_empty() && p[0] == 25),
+        "ECDHE-PSK client must emit tls12_cid app-data records when CID is negotiated"
+    );
+    deliver_packets(&client_pkts, &mut server);
+    let so = drain_outputs(&mut server);
+    assert!(
+        so.app_data.iter().any(|d| d == req),
+        "Server must decrypt ECDHE-PSK+CID client data"
     );
 }

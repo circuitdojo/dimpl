@@ -288,10 +288,14 @@ fn is_dtls12_psk_only(config: &Config) -> bool {
         return false;
     }
 
+    // "PSK-only" means every offered DTLS 1.2 suite authenticates via PSK
+    // (pure-PSK or ECDHE-PSK). A mixed config with cert-based ECDHE_ECDSA
+    // suites is not PSK-only — `new_auto` must keep a certificate around for
+    // the cert-based fallback.
     let mut suites = config.dtls12_cipher_suites().map(|cs| cs.suite());
     suites
         .next()
-        .is_some_and(|first| first.is_psk() && suites.all(|s| s.is_psk()))
+        .is_some_and(|first| first.skips_certificate() && suites.all(|s| s.skips_certificate()))
 }
 
 /// If `packet` is a Handshake record carrying a ClientHello, return the
@@ -438,7 +442,9 @@ fn client_hello_wants_psk(packet: &[u8], config: &Config) -> bool {
     for chunk in body[pos..pos + suites_len].chunks_exact(2) {
         let suite = Dtls12CipherSuite::from_u16(u16::from_be_bytes([chunk[0], chunk[1]]));
         if allowed.contains(&suite) {
-            return suite.is_psk();
+            // Both pure-PSK (0xC0A8) and ECDHE-PSK (0xCCAC) need a PSK-mode
+            // Server12 — neither uses an X.509 certificate to authenticate.
+            return suite.skips_certificate();
         }
     }
     false

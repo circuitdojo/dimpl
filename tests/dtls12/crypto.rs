@@ -66,9 +66,14 @@ fn find_server_key_exchange_group(packet: &[u8]) -> Option<u16> {
 fn dtls12_all_cipher_suites() {
     let _ = env_logger::try_init();
 
-    // Loop over all supported cipher suites and ensure we can connect
-    // Skip PSK suites — they require PSK config, not certificate-based interop
-    for &suite in Dtls12CipherSuite::all().iter().filter(|s| !s.is_psk()) {
+    // Loop over all supported cipher suites and ensure we can connect.
+    // Skip PSK and ECDHE-PSK suites — they require PSK config, not
+    // certificate-based interop. PSK interop is covered separately in
+    // `psk.rs` (dimpl ↔ dimpl) and `ossl_psk.rs` (dimpl ↔ OpenSSL).
+    for &suite in Dtls12CipherSuite::all()
+        .iter()
+        .filter(|s| !s.skips_certificate())
+    {
         eprintln!("Testing suite (dimpl client ↔️ ossl server): {:?}", suite);
 
         run_dimpl_client_vs_ossl_server_for_suite(suite);

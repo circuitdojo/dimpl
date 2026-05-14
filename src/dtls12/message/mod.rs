@@ -27,7 +27,7 @@ pub use certificate::Certificate;
 pub use certificate_request::CertificateRequest;
 pub use certificate_verify::CertificateVerify;
 pub use client_hello::ClientHello;
-pub use client_key_exchange::{ClientKeyExchange, ClientPskKeys, ExchangeKeys};
+pub use client_key_exchange::{ClientEcdhePskKeys, ClientKeyExchange, ClientPskKeys, ExchangeKeys};
 pub use digitally_signed::DigitallySigned;
 pub use extension::{Extension, ExtensionType};
 pub use extensions::connection_id::ConnectionIdExtension;
@@ -47,7 +47,9 @@ pub use crate::types::{
     Random, Sequence, SignatureAlgorithm,
 };
 pub use server_hello::ServerHello;
-pub use server_key_exchange::{PskParams, ServerKeyExchange, ServerKeyExchangeParams};
+pub use server_key_exchange::{
+    EcdhePskServerParams, PskParams, ServerKeyExchange, ServerKeyExchangeParams,
+};
 pub use wrapped::{Asn1Cert, DistinguishedName};
 
 use nom::IResult;
@@ -67,7 +69,11 @@ pub enum Dtls12CipherSuite {
     /// ECDHE with ECDSA authentication, ChaCha20-Poly1305, SHA-256
     ECDHE_ECDSA_CHACHA20_POLY1305_SHA256, // 0xCCA9
 
-    // PSK cipher suites (no certificate authentication)
+    // ECDHE-PSK cipher suites (PSK authentication, ephemeral ECDH for forward secrecy)
+    /// ECDHE-PSK with ChaCha20-Poly1305, SHA-256 (RFC 7905, forward-secure PSK)
+    ECDHE_PSK_CHACHA20_POLY1305_SHA256, // 0xCCAC
+
+    // PSK cipher suites (no certificate authentication, no forward secrecy)
     /// PSK with AES-128-CCM-8 (8-byte tag), SHA-256
     PSK_AES128_CCM_8, // 0xC0A8
 
@@ -90,6 +96,9 @@ impl Dtls12CipherSuite {
             0xC02B => Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256,
             0xCCA9 => Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256,
 
+            // ECDHE-PSK
+            0xCCAC => Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256,
+
             // PSK
             0xC0A8 => Dtls12CipherSuite::PSK_AES128_CCM_8,
 
@@ -104,6 +113,8 @@ impl Dtls12CipherSuite {
             Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384 => 0xC02C,
             Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256 => 0xC02B,
             Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 => 0xCCA9,
+
+            Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256 => 0xCCAC,
 
             Dtls12CipherSuite::PSK_AES128_CCM_8 => 0xC0A8,
 
@@ -124,6 +135,7 @@ impl Dtls12CipherSuite {
             Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
             | Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
             | Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
+            | Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256
             | Dtls12CipherSuite::PSK_AES128_CCM_8 => 12,
 
             Dtls12CipherSuite::Unknown(_) => 12, // Default length for unknown cipher suites
@@ -140,6 +152,10 @@ impl Dtls12CipherSuite {
                 KeyExchangeAlgorithm::EECDH
             }
 
+            Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256 => {
+                KeyExchangeAlgorithm::ECDHE_PSK
+            }
+
             Dtls12CipherSuite::PSK_AES128_CCM_8 => KeyExchangeAlgorithm::PSK,
 
             Dtls12CipherSuite::Unknown(_) => KeyExchangeAlgorithm::Unknown,
@@ -153,20 +169,39 @@ impl Dtls12CipherSuite {
             Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
                 | Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
                 | Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
+                | Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256
         )
     }
 
-    /// Whether this cipher suite uses PSK (Pre-Shared Key) key exchange.
+    /// Whether this cipher suite uses pure PSK key exchange (no forward secrecy).
+    ///
+    /// Returns `false` for ECDHE-PSK suites — use [`Self::is_ecdhe_psk`] or
+    /// [`Self::skips_certificate`] for those.
     pub fn is_psk(&self) -> bool {
         matches!(self, Dtls12CipherSuite::PSK_AES128_CCM_8)
     }
 
+    /// Whether this cipher suite uses ECDHE + PSK hybrid key exchange (RFC 5489).
+    pub fn is_ecdhe_psk(&self) -> bool {
+        matches!(self, Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256)
+    }
+
+    /// Whether this cipher suite authenticates without an X.509 certificate.
+    ///
+    /// Both pure-PSK and ECDHE-PSK paths skip the Certificate / CertificateRequest
+    /// / CertificateVerify handshake messages and rely on PSK + Finished MAC for
+    /// peer authentication.
+    pub fn skips_certificate(&self) -> bool {
+        self.is_psk() || self.is_ecdhe_psk()
+    }
+
     /// All supported cipher suites in server preference order.
-    pub const fn all() -> &'static [Dtls12CipherSuite; 4] {
+    pub const fn all() -> &'static [Dtls12CipherSuite; 5] {
         &[
             Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384,
             Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256,
             Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256,
+            Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256,
             Dtls12CipherSuite::PSK_AES128_CCM_8,
         ]
     }
@@ -199,6 +234,7 @@ impl Dtls12CipherSuite {
             Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384 => HashAlgorithm::SHA384,
             Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
             | Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
+            | Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256
             | Dtls12CipherSuite::PSK_AES128_CCM_8 => HashAlgorithm::SHA256,
             Dtls12CipherSuite::Unknown(_) => HashAlgorithm::Unknown(0),
         }
@@ -206,7 +242,8 @@ impl Dtls12CipherSuite {
 
     /// The signature algorithm associated with the suite's key exchange.
     ///
-    /// Returns `None` for PSK cipher suites (no signature authentication).
+    /// Returns `None` for PSK and ECDHE-PSK cipher suites (no signature authentication —
+    /// the PSK provides peer authentication via the Finished MAC).
     pub fn signature_algorithm(&self) -> Option<SignatureAlgorithm> {
         match self {
             Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
@@ -214,7 +251,8 @@ impl Dtls12CipherSuite {
             | Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 => {
                 Some(SignatureAlgorithm::ECDSA)
             }
-            Dtls12CipherSuite::PSK_AES128_CCM_8 => None,
+            Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256
+            | Dtls12CipherSuite::PSK_AES128_CCM_8 => None,
             Dtls12CipherSuite::Unknown(_) => Some(SignatureAlgorithm::Unknown(0)),
         }
     }
@@ -225,7 +263,7 @@ impl Dtls12CipherSuite {
     }
 
     /// Supported DTLS 1.2 cipher suites in server preference order.
-    pub const fn supported() -> &'static [Dtls12CipherSuite; 4] {
+    pub const fn supported() -> &'static [Dtls12CipherSuite; 5] {
         Self::all()
     }
 }
@@ -239,6 +277,9 @@ pub type CompressionMethodVec =
 pub enum KeyExchangeAlgorithm {
     EECDH,
     PSK,
+    /// Hybrid ECDHE + PSK (RFC 5489): ephemeral ECDH for forward secrecy,
+    /// PSK for peer authentication.
+    ECDHE_PSK,
     Unknown,
 }
 

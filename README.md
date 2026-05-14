@@ -36,7 +36,9 @@ Four constructors control which DTLS version is used:
   - `ECDHE_ECDSA_AES128_GCM_SHA256`
   - `ECDHE_ECDSA_CHACHA20_POLY1305_SHA256`
 - **PSK cipher suites (TLS 1.2 over DTLS)**
-  - `PSK_AES128_CCM_8`
+  - `PSK_AES128_CCM_8` — pure PSK (no forward secrecy)
+  - `ECDHE_PSK_CHACHA20_POLY1305_SHA256` — hybrid ECDHE + PSK
+    ([RFC 5489] §2 key exchange, [RFC 7905] AEAD); forward-secure
 - **Cipher suites (TLS 1.3 over DTLS)**
   - `TLS_AES_128_GCM_SHA256`
   - `TLS_AES_256_GCM_SHA384`
@@ -204,9 +206,11 @@ Rust 1.85.0
 [poll_output]: https://docs.rs/dimpl/latest/dimpl/struct.Dtls.html#method.poll_output
 [handle_timeout]: https://docs.rs/dimpl/latest/dimpl/struct.Dtls.html#method.handle_timeout
 [output]: https://docs.rs/dimpl/latest/dimpl/enum.Output.html
+[RFC 5489]: https://www.rfc-editor.org/rfc/rfc5489
 [RFC 5764]: https://www.rfc-editor.org/rfc/rfc5764
 [RFC 7714]: https://www.rfc-editor.org/rfc/rfc7714
 [RFC 7627]: https://www.rfc-editor.org/rfc/rfc7627
+[RFC 7905]: https://www.rfc-editor.org/rfc/rfc7905
 [RFC 9146]: https://www.rfc-editor.org/rfc/rfc9146
 [with_cid]: https://docs.rs/dimpl/latest/dimpl/struct.ConfigBuilder.html#method.with_connection_id
 

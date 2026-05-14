@@ -283,9 +283,10 @@ impl Config {
     /// is set. When a filter is set via the builder's `dtls12_cipher_suites`
     /// method, only suites in both the provider and the filter are returned.
     ///
-    /// PSK cipher suites are excluded when no [`PskResolver`] is configured,
-    /// preventing a certificate-mode endpoint from negotiating a PSK suite
-    /// and inadvertently skipping certificate authentication.
+    /// PSK and ECDHE-PSK cipher suites are excluded when no [`PskResolver`]
+    /// is configured, preventing a certificate-mode endpoint from negotiating
+    /// a PSK-authenticated suite and inadvertently skipping certificate
+    /// authentication.
     pub fn dtls12_cipher_suites(
         &self,
     ) -> impl Iterator<Item = &'static dyn SupportedDtls12CipherSuite> + '_ {
@@ -297,7 +298,7 @@ impl Config {
                 Some(list) => list.contains(&cs.suite()),
                 None => true,
             })
-            .filter(move |cs| has_psk || !cs.suite().is_psk())
+            .filter(move |cs| has_psk || !cs.suite().skips_certificate())
     }
 
     /// Allowed DTLS 1.3 cipher suites, filtered by the config's allow-list.
@@ -768,17 +769,21 @@ impl ConfigBuilder {
         }
 
         // Validate cipher suite filters: at least one version must have suites.
-        // Mirror Config::dtls12_cipher_suites() by dropping PSK suites when no PSK
-        // is configured, so a PSK-only filter without a PSK resolver fails fast.
+        // Mirror Config::dtls12_cipher_suites() by dropping all PSK-authenticated
+        // suites (pure PSK and ECDHE-PSK alike) when no PSK is configured, so a
+        // PSK-only filter without a PSK resolver fails fast at build time
+        // rather than crashing mid-handshake when the resolver is consulted.
         let has_psk = self.psk.is_some();
         let dtls12_suites: Vec<_> = {
             let all = crypto_provider.supported_cipher_suites();
             match &self.dtls12_cipher_suites {
                 Some(list) => all
                     .filter(|cs| list.contains(&cs.suite()))
-                    .filter(|cs| has_psk || !cs.suite().is_psk())
+                    .filter(|cs| has_psk || !cs.suite().skips_certificate())
                     .collect(),
-                None => all.filter(|cs| has_psk || !cs.suite().is_psk()).collect(),
+                None => all
+                    .filter(|cs| has_psk || !cs.suite().skips_certificate())
+                    .collect(),
             }
         };
         let dtls12_count = dtls12_suites.len();
@@ -797,15 +802,20 @@ impl ConfigBuilder {
             ));
         }
 
-        // When PSK is configured, at least one negotiable DTLS 1.2 suite must be
-        // a PSK suite. The only PSK suite we implement today is DTLS 1.2 (0xC0A8),
-        // so a surviving DTLS 1.3 suite is not a fallback: Dtls::new_12_psk only
-        // speaks DTLS 1.2, and under AuthMode::Psk every non-PSK suite is rejected
-        // by CryptoContext::is_cipher_suite_compatible.
-        if has_psk && !dtls12_suites.iter().any(|cs| cs.suite().is_psk()) {
+        // When PSK is configured, at least one negotiable DTLS 1.2 suite must
+        // authenticate via PSK — either pure PSK (0xC0A8) or ECDHE-PSK
+        // (0xCCAC). A surviving DTLS 1.3 suite is not a fallback:
+        // Dtls::new_12_psk only speaks DTLS 1.2, and under AuthMode::Psk every
+        // certificate-authenticated suite is rejected by
+        // CryptoContext::is_cipher_suite_compatible.
+        if has_psk
+            && !dtls12_suites
+                .iter()
+                .any(|cs| cs.suite().skips_certificate())
+        {
             return Err(Error::ConfigError(
                 "PSK is configured but no PSK cipher suite remains after filtering \
-                 DTLS 1.2 suites. Include at least one PSK suite in \
+                 DTLS 1.2 suites. Include at least one PSK or ECDHE-PSK suite in \
                  dtls12_cipher_suites."
                     .to_string(),
             ));
@@ -1136,8 +1146,10 @@ mod tests {
     fn psk_suites_excluded_without_resolver() {
         let config = Config::default();
         assert!(
-            config.dtls12_cipher_suites().all(|cs| !cs.suite().is_psk()),
-            "PSK suites should be excluded when no PskResolver is configured"
+            config
+                .dtls12_cipher_suites()
+                .all(|cs| !cs.suite().skips_certificate()),
+            "PSK and ECDHE-PSK suites should be excluded when no PskResolver is configured"
         );
     }
 
@@ -1154,9 +1166,30 @@ mod tests {
             .with_psk_server(None, Arc::new(DummyResolver))
             .build()
             .expect("config with PSK resolver should build");
+        let suites: Vec<_> = config.dtls12_cipher_suites().map(|cs| cs.suite()).collect();
         assert!(
-            config.dtls12_cipher_suites().any(|cs| cs.suite().is_psk()),
-            "PSK suites should be included when a PskResolver is configured"
+            suites.iter().any(|s| s.is_psk()),
+            "pure-PSK suite must be included when a PskResolver is configured"
+        );
+        assert!(
+            suites.iter().any(|s| s.is_ecdhe_psk()),
+            "ECDHE-PSK suite must be included when a PskResolver is configured"
+        );
+    }
+
+    #[test]
+    fn ecdhe_psk_only_filter_without_resolver_rejected() {
+        // Filter restricts DTLS 1.2 to ECDHE-PSK only and disables DTLS 1.3.
+        // Without a PskResolver, the filter drops the lone ECDHE-PSK suite,
+        // leaving no negotiable DTLS 1.2 suite — build() must reject this
+        // rather than producing a config that would crash mid-handshake.
+        let result = Config::builder()
+            .dtls12_cipher_suites(&[Dtls12CipherSuite::ECDHE_PSK_CHACHA20_POLY1305_SHA256])
+            .dtls13_cipher_suites(&[])
+            .build();
+        assert!(
+            result.is_err(),
+            "ECDHE-PSK-only DTLS 1.2 config without a PskResolver must be rejected"
         );
     }
 

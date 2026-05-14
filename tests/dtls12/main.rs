@@ -9,6 +9,7 @@ mod edge;
 mod fragmentation;
 mod handshake;
 mod ossl;
+mod ossl_psk;
 mod psk;
 mod reorder;
 mod retransmit;

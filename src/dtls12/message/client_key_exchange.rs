@@ -16,6 +16,9 @@ pub struct ClientKeyExchange {
 pub enum ExchangeKeys {
     Ecdh(ClientEcdhKeys),
     Psk(ClientPskKeys),
+    /// Hybrid ECDHE-PSK ClientKeyExchange (RFC 5489 §2):
+    /// `uint16 identity_length + identity + uint8 pubkey_length + ECPoint`.
+    EcdhePsk(ClientEcdhePskKeys),
 }
 
 /// ECDHE key exchange parameters
@@ -77,6 +80,10 @@ impl ClientKeyExchange {
                 let (input, psk_keys) = ClientPskKeys::parse(input, base_offset)?;
                 (input, ExchangeKeys::Psk(psk_keys))
             }
+            KeyExchangeAlgorithm::ECDHE_PSK => {
+                let (input, keys) = ClientEcdhePskKeys::parse(input, base_offset)?;
+                (input, ExchangeKeys::EcdhePsk(keys))
+            }
             _ => return Err(Err::Failure(Error::new(input, nom::error::ErrorKind::Tag))),
         };
 
@@ -87,6 +94,7 @@ impl ClientKeyExchange {
         match &self.exchange_keys {
             ExchangeKeys::Ecdh(ecdh_keys) => ecdh_keys.serialize(buf, output),
             ExchangeKeys::Psk(psk_keys) => psk_keys.serialize(buf, output),
+            ExchangeKeys::EcdhePsk(keys) => keys.serialize(buf, output),
         }
     }
 
@@ -137,6 +145,71 @@ impl ClientPskKeys {
     pub fn serialize_from_bytes(identity: &[u8], output: &mut Buf) {
         output.extend_from_slice(&(identity.len() as u16).to_be_bytes());
         output.extend_from_slice(identity);
+    }
+}
+
+/// Hybrid ECDHE-PSK ClientKeyExchange (RFC 5489 §2).
+///
+/// Wire format: `uint16 identity_length + identity + uint8 pubkey_length + ECPoint`.
+/// The identity length-prefix is uint16 (RFC 4279 §2 framing) while the ECPoint
+/// length-prefix is uint8 (RFC 4492 §5.7 / RFC 8422 framing). The curve and
+/// group are not repeated here — they were fixed by the server in its
+/// ServerKeyExchange.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ClientEcdhePskKeys {
+    pub identity_range: Range<usize>,
+    pub public_key_range: Range<usize>,
+}
+
+impl ClientEcdhePskKeys {
+    pub fn identity<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
+        &buf[self.identity_range.clone()]
+    }
+
+    pub fn public_key<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
+        &buf[self.public_key_range.clone()]
+    }
+
+    pub fn parse(input: &[u8], base_offset: usize) -> IResult<&[u8], ClientEcdhePskKeys> {
+        let original_input = input;
+        let (input, identity_len) = nom::number::complete::be_u16(input)?;
+        let (input, identity_slice) = take(identity_len as usize)(input)?;
+
+        let id_rel = identity_slice.as_ptr() as usize - original_input.as_ptr() as usize;
+        let id_start = base_offset + id_rel;
+        let id_end = id_start + identity_slice.len();
+
+        let (input, pubkey_len) = be_u8(input)?;
+        let (input, pubkey_slice) = take(pubkey_len as usize)(input)?;
+
+        let pk_rel = pubkey_slice.as_ptr() as usize - original_input.as_ptr() as usize;
+        let pk_start = base_offset + pk_rel;
+        let pk_end = pk_start + pubkey_slice.len();
+
+        Ok((
+            input,
+            ClientEcdhePskKeys {
+                identity_range: id_start..id_end,
+                public_key_range: pk_start..pk_end,
+            },
+        ))
+    }
+
+    pub fn serialize(&self, buf: &[u8], output: &mut Buf) {
+        let identity = self.identity(buf);
+        let public_key = self.public_key(buf);
+        output.extend_from_slice(&(identity.len() as u16).to_be_bytes());
+        output.extend_from_slice(identity);
+        output.push(public_key.len() as u8);
+        output.extend_from_slice(public_key);
+    }
+
+    /// Serialize directly from identity + public-key bytes (for sending).
+    pub fn serialize_from_bytes(identity: &[u8], public_key: &[u8], output: &mut Buf) {
+        output.extend_from_slice(&(identity.len() as u16).to_be_bytes());
+        output.extend_from_slice(identity);
+        output.push(public_key.len() as u8);
+        output.extend_from_slice(public_key);
     }
 }
 
@@ -207,5 +280,46 @@ mod test {
             panic!("expected Psk variant");
         };
         assert!(psk.identity_range.is_empty());
+    }
+
+    #[test]
+    fn ecdhe_psk_roundtrip() {
+        // RFC 5489 §2: uint16 identity_length || identity || uint8 pubkey_length || pubkey.
+        const MESSAGE: &[u8] = &[
+            0x00, 0x05, // identity length = 5
+            b'h', b'e', b'l', b'l', b'o', // identity
+            0x04, // pubkey length
+            0x0a, 0x0b, 0x0c, 0x0d, // pubkey
+        ];
+
+        let (rest, parsed) =
+            ClientKeyExchange::parse(MESSAGE, 0, KeyExchangeAlgorithm::ECDHE_PSK).unwrap();
+        assert!(rest.is_empty());
+
+        let ExchangeKeys::EcdhePsk(keys) = &parsed.exchange_keys else {
+            panic!("expected EcdhePsk variant");
+        };
+        assert_eq!(&MESSAGE[keys.identity_range.clone()], b"hello");
+        assert_eq!(&MESSAGE[keys.public_key_range.clone()], &[10, 11, 12, 13]);
+
+        let mut serialized = Buf::new();
+        parsed.serialize(MESSAGE, &mut serialized);
+        assert_eq!(&*serialized, MESSAGE);
+    }
+
+    #[test]
+    fn ecdhe_psk_rejects_truncated_pubkey() {
+        // Valid identity + pubkey_length=10 but only 3 bytes follow.
+        let bad: &[u8] = &[
+            0x00, 0x03, // identity length = 3
+            b'x', b'y', b'z', // identity
+            0x0a, // pubkey length = 10
+            0x01, 0x02, 0x03, // pubkey (only 3 bytes)
+        ];
+        let result = ClientKeyExchange::parse(bad, 0, KeyExchangeAlgorithm::ECDHE_PSK);
+        assert!(
+            result.is_err(),
+            "parser must reject pubkey shorter than advertised length"
+        );
     }
 }

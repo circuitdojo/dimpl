@@ -33,8 +33,10 @@ pub mod io_buf;
 mod stream;
 
 mod dtls;
+pub mod psk;
 use dimpl::SrtpProfile;
 pub use dtls::{OsslDtlsImpl, dtls_ssl_create};
+pub use psk::OsslDtlsPsk;
 
 pub use io_buf::DatagramSend;
 use std::collections::VecDeque;

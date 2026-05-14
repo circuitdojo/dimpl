@@ -171,6 +171,39 @@ impl CryptoContext {
         Ok(())
     }
 
+    /// Wrap the existing ECDHE shared secret with the PSK per RFC 5489 §2.
+    ///
+    /// Precondition: the ECDHE shared secret `Z` has already been computed and
+    /// stored in `self.pre_master_secret` (via `process_ecdh_params` or
+    /// `compute_shared_secret`), and `self.psk` has been set via `set_psk`.
+    ///
+    /// Replaces the stored pre-master secret with the RFC 5489 §2 hybrid form:
+    ///
+    /// ```text
+    /// PreMasterSecret = uint16(len_Z) || Z || uint16(len_PSK) || PSK
+    /// ```
+    ///
+    /// where `Z` is the ECDHE shared secret (`other_secret` in RFC 4279 §2
+    /// terminology — but NOT zero-padded; ECDHE provides real entropy, unlike
+    /// the pure-PSK case where `other_secret` is all zeros).
+    pub fn wrap_ecdhe_psk_pre_master_secret(&mut self) -> Result<(), String> {
+        let z = self
+            .pre_master_secret
+            .as_ref()
+            .ok_or("ECDHE shared secret not computed")?;
+        let psk = self.psk.as_ref().ok_or("PSK not set")?;
+
+        let z_len = z.len();
+        let psk_len = psk.len();
+        let mut pms = Buf::new();
+        pms.extend_from_slice(&(z_len as u16).to_be_bytes());
+        pms.extend_from_slice(z);
+        pms.extend_from_slice(&(psk_len as u16).to_be_bytes());
+        pms.extend_from_slice(psk);
+        self.pre_master_secret = Some(pms);
+        Ok(())
+    }
+
     /// Initialize ECDHE key exchange (server role) and return our ephemeral public key
     pub fn init_ecdh_server(
         &mut self,
@@ -636,10 +669,10 @@ mod tests {
         let ctx = CryptoContext::new(auth, config);
 
         for suite in Dtls12CipherSuite::supported() {
-            if suite.is_psk() {
+            if suite.skips_certificate() {
                 assert!(
                     !ctx.is_cipher_suite_compatible(*suite),
-                    "Certificate-mode context must reject PSK suite {:?}",
+                    "Certificate-mode context must reject PSK/ECDHE-PSK suite {:?}",
                     suite
                 );
             }
@@ -653,11 +686,11 @@ mod tests {
         let auth = cert_auth_mode(&config);
         let ctx = CryptoContext::new(auth, config);
 
-        // At least one ECDHE_ECDSA suite should be compatible
+        // At least one cert-authenticated ECDHE suite should be compatible
         assert!(
             Dtls12CipherSuite::supported()
                 .iter()
-                .filter(|s| !s.is_psk())
+                .filter(|s| !s.skips_certificate())
                 .any(|s| ctx.is_cipher_suite_compatible(*s)),
             "Certificate-mode context must accept at least one ECDHE suite"
         );
@@ -668,8 +701,10 @@ mod tests {
         let config = Arc::new(Config::default());
         let ctx = CryptoContext::new(AuthMode::Psk, config);
 
+        // Only certificate-authenticated suites must be rejected. Both pure-PSK
+        // and ECDHE-PSK suites authenticate via PSK and are PSK-mode-compatible.
         for suite in Dtls12CipherSuite::supported() {
-            if !suite.is_psk() {
+            if !suite.skips_certificate() {
                 assert!(
                     !ctx.is_cipher_suite_compatible(*suite),
                     "PSK-mode context must reject certificate suite {:?}",
@@ -680,16 +715,73 @@ mod tests {
     }
 
     #[test]
+    fn ecdhe_psk_premaster_format_matches_rfc_5489() {
+        // RFC 5489 §2: PreMasterSecret = uint16(len_Z) || Z || uint16(len_PSK) || PSK
+        let config = Arc::new(Config::default());
+        let mut ctx = CryptoContext::new(AuthMode::Psk, config);
+
+        // Stage a fake ECDHE shared secret (`Z`) and a PSK with distinct
+        // lengths so the framing bug "swap lengths" would be caught.
+        let z: &[u8] = b"ecdhe-shared-secret-z";
+        let psk: &[u8] = b"psk";
+
+        ctx.pre_master_secret = Some({
+            let mut b = Buf::new();
+            b.extend_from_slice(z);
+            b
+        });
+        ctx.set_psk(psk.to_vec());
+
+        ctx.wrap_ecdhe_psk_pre_master_secret().unwrap();
+
+        let pms = ctx.pre_master_secret.as_ref().unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(z.len() as u16).to_be_bytes());
+        expected.extend_from_slice(z);
+        expected.extend_from_slice(&(psk.len() as u16).to_be_bytes());
+        expected.extend_from_slice(psk);
+
+        assert_eq!(&pms[..], &expected[..]);
+        // Sanity: differs from RFC 4279 pure-PSK format (which zero-pads first half).
+        let mut rfc_4279 = Vec::new();
+        rfc_4279.extend_from_slice(&(psk.len() as u16).to_be_bytes());
+        rfc_4279.extend(std::iter::repeat_n(0u8, psk.len()));
+        rfc_4279.extend_from_slice(&(psk.len() as u16).to_be_bytes());
+        rfc_4279.extend_from_slice(psk);
+        assert_ne!(&pms[..], &rfc_4279[..]);
+    }
+
+    #[test]
+    fn ecdhe_psk_premaster_requires_z_and_psk() {
+        let config = Arc::new(Config::default());
+        let mut ctx = CryptoContext::new(AuthMode::Psk, config.clone());
+        // No Z set
+        assert!(ctx.wrap_ecdhe_psk_pre_master_secret().is_err());
+
+        let mut ctx = CryptoContext::new(AuthMode::Psk, config);
+        ctx.pre_master_secret = Some({
+            let mut b = Buf::new();
+            b.extend_from_slice(b"z");
+            b
+        });
+        // No PSK set
+        assert!(ctx.wrap_ecdhe_psk_pre_master_secret().is_err());
+    }
+
+    #[test]
     fn psk_mode_accepts_psk_suites() {
         let config = Arc::new(Config::default());
         let ctx = CryptoContext::new(AuthMode::Psk, config);
 
-        assert!(
-            Dtls12CipherSuite::supported()
-                .iter()
-                .filter(|s| s.is_psk())
-                .any(|s| ctx.is_cipher_suite_compatible(*s)),
-            "PSK-mode context must accept at least one PSK suite"
-        );
+        // Both pure-PSK and ECDHE-PSK suites must be accepted.
+        for suite in Dtls12CipherSuite::supported() {
+            if suite.skips_certificate() {
+                assert!(
+                    ctx.is_cipher_suite_compatible(*suite),
+                    "PSK-mode context must accept PSK/ECDHE-PSK suite {:?}",
+                    suite
+                );
+            }
+        }
     }
 }
