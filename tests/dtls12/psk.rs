@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use dimpl::crypto::Dtls12CipherSuite;
 use dimpl::{Config, Dtls, PskResolver};
 
-use crate::common::{collect_packets, deliver_packets, drain_outputs};
+use crate::common::{collect_packets, deliver_packets, drain_outputs, psk_provider};
 
 /// Simple PSK resolver that returns a fixed key for a known identity.
 struct FixedPsk {
@@ -22,20 +22,6 @@ impl PskResolver for FixedPsk {
             None
         }
     }
-}
-
-fn psk_provider(suite: Dtls12CipherSuite) -> dimpl::crypto::CryptoProvider {
-    let mut provider = Config::default().crypto_provider().clone();
-    let psk_suite = provider
-        .cipher_suites
-        .iter()
-        .copied()
-        .find(|cs| cs.suite() == suite)
-        .unwrap_or_else(|| panic!("{:?} not in provider", suite));
-
-    let suites = Box::leak(Box::new([psk_suite]));
-    provider.cipher_suites = suites;
-    provider
 }
 
 /// Returns (client_config, server_config) for PSK tests.

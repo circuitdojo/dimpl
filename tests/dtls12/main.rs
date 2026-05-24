@@ -1,6 +1,7 @@
 #[path = "../ossl/mod.rs"]
 mod ossl_helper;
 
+mod abbreviated;
 mod cid;
 mod common;
 mod crypto;

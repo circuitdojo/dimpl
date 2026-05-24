@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dimpl::crypto::Dtls12CipherSuite;
 use dimpl::{Config, Dtls, Output, SrtpProfile};
 
 /// Parsed DTLS 1.2 record header.
@@ -156,6 +157,22 @@ pub fn deliver_packets(packets: &[Vec<u8>], dest: &mut Dtls) {
 pub fn trigger_timeout(ep: &mut Dtls, now: &mut Instant) {
     *now += Duration::from_secs(2);
     ep.handle_timeout(*now).expect("handle_timeout");
+}
+
+/// Build a `CryptoProvider` restricted to a single DTLS 1.2 cipher suite.
+///
+/// Useful in tests that want to pin the negotiated suite to avoid
+/// ambiguity when checking session resumption or key material.
+pub fn psk_provider(suite: Dtls12CipherSuite) -> dimpl::crypto::CryptoProvider {
+    let mut provider = Config::default().crypto_provider().clone();
+    let psk_suite = provider
+        .cipher_suites
+        .iter()
+        .copied()
+        .find(|cs| cs.suite() == suite)
+        .unwrap_or_else(|| panic!("{suite:?} not in provider"));
+    provider.cipher_suites = Box::leak(Box::new([psk_suite]));
+    provider
 }
 
 /// Create a DTLS 1.2 config with default settings.

@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::crypto::{CryptoProvider, SupportedDtls12CipherSuite};
 use crate::crypto::{SupportedDtls13CipherSuite, SupportedKxGroup};
 use crate::dtls12::message::Dtls12CipherSuite;
+use crate::session::SessionStore;
 use crate::types::{Dtls13CipherSuite, NamedGroup};
 use crate::{ConfigError, Error};
 
@@ -77,6 +78,11 @@ pub struct Config {
     kx_groups: Option<Vec<NamedGroup>>,
     psk: Option<Psk>,
     connection_id: Option<Vec<u8>>,
+    /// `session_id` to offer in the client's `ClientHello`.
+    /// Set by `ConfigBuilder::with_offered_session_id`.
+    offered_session_id: Option<Vec<u8>>,
+    /// Session store for abbreviated handshake resumption.
+    session_store: Option<Arc<dyn SessionStore>>,
 }
 
 impl Config {
@@ -99,6 +105,8 @@ impl Config {
             kx_groups: None,
             psk: None,
             connection_id: None,
+            offered_session_id: None,
+            session_store: None,
         }
     }
 
@@ -277,6 +285,28 @@ impl Config {
         self.connection_id.as_deref()
     }
 
+    /// `session_id` bytes the client will offer in its `ClientHello`.
+    ///
+    /// Set via [`ConfigBuilder::with_offered_session_id`]. Non-empty only on
+    /// the client side when attempting session resumption. If the server
+    /// echoes the same session ID and the [`SessionStore`] has a match, the
+    /// abbreviated handshake path is taken.
+    pub fn offered_session_id(&self) -> Option<&[u8]> {
+        self.offered_session_id.as_deref()
+    }
+
+    /// The session store used to save and look up DTLS 1.2 sessions.
+    ///
+    /// Set via [`ConfigBuilder::with_session_store`].
+    /// - **Server**: dimpl calls [`SessionStore::store`] after every full
+    ///   handshake and [`SessionStore::lookup`] when a `ClientHello` carries a
+    ///   non-empty `session_id`.
+    /// - **Client**: dimpl calls [`SessionStore::store`] after a full handshake
+    ///   so the caller can persist the session ID for the next connection.
+    pub fn session_store(&self) -> Option<&Arc<dyn SessionStore>> {
+        self.session_store.as_ref()
+    }
+
     /// Allowed DTLS 1.2 cipher suites, filtered by the config's allow-list.
     ///
     /// Returns all provider-supported DTLS 1.2 cipher suites when no filter
@@ -353,6 +383,8 @@ pub struct ConfigBuilder {
     kx_groups: Option<Vec<NamedGroup>>,
     psk: Option<Psk>,
     connection_id: Option<Vec<u8>>,
+    offered_session_id: Option<Vec<u8>>,
+    session_store: Option<Arc<dyn SessionStore>>,
 }
 
 impl ConfigBuilder {
@@ -667,6 +699,48 @@ impl ConfigBuilder {
         self
     }
 
+    /// Supply a `session_id` for the client to offer in its `ClientHello`.
+    ///
+    /// Call this on reconnect after storing the previous session's ID with
+    /// [`with_session_store`]. If the server's [`SessionStore`] recognises the
+    /// offered ID and the cipher suite still matches, both sides skip the
+    /// key-exchange flights and complete the handshake in one round-trip.
+    ///
+    /// The bytes must be 1–32 octets (the valid wire range for `session_id` per
+    /// RFC 5246 §7.4.1.2). [`ConfigBuilder::build`] returns
+    /// [`Error::ConfigError`] if the slice is longer than 32 bytes or empty.
+    ///
+    /// This setting is meaningful only on the **client** side; server-side
+    /// configs ignore it.
+    ///
+    /// [`with_session_store`]: ConfigBuilder::with_session_store
+    pub fn with_offered_session_id(mut self, id: impl Into<Vec<u8>>) -> Self {
+        let v: Vec<u8> = id.into();
+        if !v.is_empty() {
+            self.offered_session_id = Some(v);
+        }
+        self
+    }
+
+    /// Attach a session store to enable abbreviated (resumed) handshakes.
+    ///
+    /// The same `Arc<dyn SessionStore>` should be shared across all connection
+    /// `Config`s on a server so that a session stored by one connection task
+    /// is visible to future connections.
+    ///
+    /// After every successful **full** handshake dimpl calls
+    /// [`SessionStore::store`] with the negotiated `session_id` and a
+    /// [`StoredSession`] holding the master secret. On the next connection,
+    /// if the client offers that ID (via [`with_offered_session_id`]) and the
+    /// server finds it via [`SessionStore::lookup`], the abbreviated path is
+    /// taken automatically.
+    ///
+    /// [`with_offered_session_id`]: ConfigBuilder::with_offered_session_id
+    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+
     /// Build the configuration.
     ///
     /// This validates the crypto provider before returning the configuration.
@@ -731,6 +805,17 @@ impl ConfigBuilder {
                     len: cid.len(),
                     max: crate::crypto::DTLS12_CID_MAX_LEN,
                 }));
+            }
+        }
+
+        // Validate offered_session_id: RFC 5246 §7.4.1.2 caps session_id at 32 bytes.
+        // Empty is rejected here (the builder method already filters it out, but be
+        // defensive) so callers never get a silent no-op from an empty slice.
+        if let Some(ref id) = self.offered_session_id {
+            if id.is_empty() || id.len() > 32 {
+                return Err(Error::ConfigError(
+                    ConfigError::OfferedSessionIdLengthOutOfRange(id.len()),
+                ));
             }
         }
 
@@ -853,6 +938,8 @@ impl ConfigBuilder {
             kx_groups: self.kx_groups,
             psk: self.psk,
             connection_id: self.connection_id,
+            offered_session_id: self.offered_session_id,
+            session_store: self.session_store,
         })
     }
 }

@@ -188,6 +188,8 @@ pub enum CryptoError {
     UnsupportedEcdheNamedGroup(NamedGroup),
     /// The requested DTLS 1.2 cipher suite is unsupported.
     UnsupportedCipherSuite(Dtls12CipherSuite),
+    /// A restored master secret was not exactly 48 bytes.
+    InvalidMasterSecretLength(usize),
     /// The requested HMAC hash algorithm is unsupported.
     UnsupportedHmacHash(HashAlgorithm),
     /// The requested signature algorithm is unsupported.
@@ -599,6 +601,8 @@ pub enum ConfigError {
     /// Connection ID (RFC 9146, DTLS 1.2) is configured but cipher-suite
     /// filtering removed every DTLS 1.2 suite.
     ConnectionIdWithoutDtls12CipherSuite,
+    /// The offered session ID length is outside RFC 5246 §7.4.1.2's 1–32 byte range.
+    OfferedSessionIdLengthOutOfRange(usize),
     /// Crypto provider validation failed.
     CryptoProvider(CryptoProviderValidationError),
 }
@@ -962,6 +966,9 @@ impl fmt::Display for CryptoError {
             Self::UnsupportedCipherSuite(suite) => {
                 write!(f, "unsupported cipher suite: {suite:?}")
             }
+            Self::InvalidMasterSecretLength(len) => {
+                write!(f, "master secret must be 48 bytes, got {len}")
+            }
             Self::UnsupportedHmacHash(hash) => {
                 write!(f, "unsupported HMAC hash algorithm: {hash:?}")
             }
@@ -1308,6 +1315,12 @@ impl fmt::Display for ConfigError {
                     "in `dtls12_cipher_suites` or drop `with_connection_id`"
                 )
             ),
+            Self::OfferedSessionIdLengthOutOfRange(len) => {
+                write!(
+                    f,
+                    "offered_session_id length {len} is out of range (1-32 bytes per RFC 5246 §7.4.1.2)"
+                )
+            }
             Self::AeadEncryptionLimitTooSmall => {
                 write!(f, "aead_encryption_limit must be at least 1")
             }

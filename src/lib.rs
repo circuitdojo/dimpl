@@ -258,6 +258,11 @@ pub use error::{
 mod config;
 pub use config::{Config, ConfigBuilder, Psk, PskResolver};
 
+mod session;
+pub use session::{MasterSecret, SessionStore, StoredSession};
+
+pub use dtls12::message::Dtls12CipherSuite;
+
 #[cfg(feature = "rcgen")]
 pub mod certificate;
 
@@ -658,6 +663,22 @@ impl Dtls {
             Inner::Client12(c) => c.engine().inbound_cid(),
             Inner::Server12(s) => s.engine().inbound_cid(),
             Inner::Client13(_) | Inner::Server13(_) | Inner::ClientPending(_) => None,
+        }
+    }
+
+    /// Return the DTLS 1.2 `session_id` negotiated during the last handshake.
+    ///
+    /// Returns `Some` after a full (or abbreviated) DTLS 1.2 handshake has
+    /// completed. The session ID is a server-generated opaque value (1–32
+    /// bytes) suitable for keying a [`SessionStore`].
+    ///
+    /// Returns `None` for DTLS 1.3 connections and before any handshake
+    /// completes.
+    pub fn session_id(&self) -> Option<&[u8]> {
+        match self.inner.as_ref()? {
+            Inner::Client12(c) => c.session_id(),
+            Inner::Server12(s) => s.session_id(),
+            _ => None,
         }
     }
 

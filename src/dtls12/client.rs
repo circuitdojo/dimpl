@@ -18,6 +18,8 @@ use std::time::Instant;
 use arrayvec::ArrayVec;
 use subtle::ConstantTimeEq;
 
+use std::sync::Arc;
+
 use crate::buffer::{Buf, ToBuf};
 use crate::crypto::SrtpProfile;
 use crate::dtls12::Server;
@@ -30,6 +32,7 @@ use crate::dtls12::message::{ConnectionIdExtension, Random, SessionId};
 use crate::dtls12::message::{DigitallySigned, Dtls12CipherSuite};
 use crate::dtls12::message::{ExtensionType, KeyExchangeAlgorithm, MessageType, ProtocolVersion};
 use crate::dtls12::message::{SignatureAndHashAlgorithm, UseSrtpExtension};
+use crate::session::{MasterSecret, StoredSession};
 use crate::{Config, DtlsCertificate, Error, InternalError, KeyingMaterial, Output};
 
 /// DTLS client
@@ -98,11 +101,18 @@ impl Client {
     pub(crate) fn new_with_engine(mut engine: Engine, now: Instant) -> Client {
         engine.set_client(true);
 
+        // Pre-populate session_id from config so it is included in the
+        // ClientHello (abbreviated handshake attempt).
+        let offered_session_id = engine
+            .config()
+            .offered_session_id()
+            .and_then(|id| SessionId::try_new(id).ok());
+
         Client {
             state: State::SendClientHello,
             engine,
             random: None,
-            session_id: None,
+            session_id: offered_session_id,
             cookie: None,
             extension_data: Buf::new(),
             negotiated_srtp_profile: None,
@@ -216,6 +226,13 @@ impl Client {
         self.state == State::Closed
             && self.local_events.is_empty()
             && !self.engine.has_pending_close_output()
+    }
+
+    /// Return the `session_id` negotiated during the last handshake.
+    ///
+    /// Non-empty after any successful full or abbreviated handshake.
+    pub fn session_id(&self) -> Option<&[u8]> {
+        self.session_id.as_deref().filter(|id| !id.is_empty())
     }
 
     pub fn handle_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
@@ -342,6 +359,11 @@ enum State {
     AwaitChangeCipherSpec,
     AwaitNewSessionTicket,
     AwaitFinished,
+    // Abbreviated (session resumption) path — RFC 5246 §7.3
+    AwaitAbbreviatedChangeCipherSpec,
+    AwaitAbbreviatedFinished,
+    SendAbbreviatedChangeCipherSpec,
+    SendAbbreviatedFinished,
     AwaitApplicationData,
     Closed,
 }
@@ -364,6 +386,10 @@ impl State {
             State::AwaitChangeCipherSpec => "AwaitChangeCipherSpec",
             State::AwaitNewSessionTicket => "AwaitNewSessionTicket",
             State::AwaitFinished => "AwaitFinished",
+            State::AwaitAbbreviatedChangeCipherSpec => "AwaitAbbreviatedChangeCipherSpec",
+            State::AwaitAbbreviatedFinished => "AwaitAbbreviatedFinished",
+            State::SendAbbreviatedChangeCipherSpec => "SendAbbreviatedChangeCipherSpec",
+            State::SendAbbreviatedFinished => "SendAbbreviatedFinished",
             State::AwaitApplicationData => "AwaitApplicationData",
             State::Closed => "Closed",
         }
@@ -386,6 +412,14 @@ impl State {
             State::AwaitChangeCipherSpec => self.await_change_cipher_spec(client),
             State::AwaitNewSessionTicket => self.await_new_session_ticket(client),
             State::AwaitFinished => self.await_finished(client),
+            State::AwaitAbbreviatedChangeCipherSpec => {
+                self.await_abbreviated_change_cipher_spec(client)
+            }
+            State::AwaitAbbreviatedFinished => self.await_abbreviated_finished(client),
+            State::SendAbbreviatedChangeCipherSpec => {
+                self.send_abbreviated_change_cipher_spec(client)
+            }
+            State::SendAbbreviatedFinished => self.send_abbreviated_finished(client),
             State::AwaitApplicationData => self.await_application_data(client),
             State::Closed => Ok(self),
         }
@@ -552,6 +586,14 @@ impl State {
 
         // Note: we keep offered suites local; we don't enforce echo here
         client.engine.set_cipher_suite(cs);
+        // Capture the originally-offered session_id before overwriting with the
+        // server-echoed value. The abbreviated detection below needs to know what
+        // WE put in the ClientHello, not what the server reflected back.
+        let originally_offered_id = client
+            .engine
+            .config()
+            .offered_session_id()
+            .and_then(|id| SessionId::try_new(id).ok());
         client.session_id = Some(server_hello.session_id);
         client.server_random = Some(server_hello.random);
 
@@ -637,6 +679,36 @@ impl State {
             client.engine.set_cid_negotiated(our_cid, peer_cid);
             debug!("Connection ID negotiated");
         }
+
+        // ── Abbreviated handshake detection ───────────────────────────────
+        // Take the abbreviated path only when:
+        //   1. We offered a non-empty session_id in the ClientHello, AND
+        //   2. The server echoed the exact same ID back (confirming acceptance), AND
+        //   3. Our session store has a matching entry with a compatible cipher suite.
+        if let Some(offered_id) = originally_offered_id {
+            if server_hello.session_id == offered_id && !offered_id.is_empty() {
+                if let Some(store) = client.engine.config().session_store() {
+                    if let Some(session) = store.lookup(&offered_id) {
+                        if session.cipher_suite == cs {
+                            debug!(
+                                "Session resumption: server echoed session_id {:02x?}; taking abbreviated path",
+                                &*offered_id
+                            );
+                            // Restore master secret and derive fresh traffic
+                            // keys from the stored master + new randoms.
+                            // Keys must be ready before the server's Finished
+                            // arrives (it's sent encrypted after server CCS).
+                            if let Err(e) = derive_abbreviated_keys(client, cs, &session) {
+                                return Err(e.into());
+                            }
+                            // client.session_id already set to server_hello.session_id above.
+                            return Ok(Self::AwaitAbbreviatedChangeCipherSpec);
+                        }
+                    }
+                }
+            }
+        }
+        // ──────────────────────────────────────────────────────────────────
 
         // PSK suites skip Certificate; go directly to ServerKeyExchange
         if cs.is_psk() {
@@ -1243,44 +1315,162 @@ impl State {
                 .push_back(LocalEvent::ConnectionId(cid.to_vec()));
         }
 
-        // Extract and emit SRTP keying material if we have a negotiated profile
-        if let Some(profile) = client.negotiated_srtp_profile {
-            let suite_hash = client.engine.cipher_suite().unwrap().hash_algorithm();
-
-            let mut out = client.engine.pop_buffer();
-            let mut scratch = client.engine.pop_buffer();
-            if let Ok(keying_material) = client
-                .engine
-                .crypto_context()
-                .extract_srtp_keying_material(profile, suite_hash, &mut out, &mut scratch)
-            {
-                client.engine.push_buffer(out);
-                client.engine.push_buffer(scratch);
-                // Emit the keying material event with the negotiated profile
-                debug!(
-                    "SRTP keying material extracted ({} bytes) for profile: {:?}",
-                    keying_material.len(),
-                    profile
-                );
-                // expect should be correct here since we negotiated the profile
-                let profile = client
-                    .negotiated_srtp_profile
-                    .expect("SRTP profile should be negotiated");
-                client
-                    .local_events
-                    .push_back(LocalEvent::KeyingMaterial(keying_material, profile));
-            } else {
-                client.engine.push_buffer(out);
-                client.engine.push_buffer(scratch);
-            }
-        }
+        emit_srtp_keying_material(
+            &mut client.engine,
+            &mut client.local_events,
+            client.negotiated_srtp_profile,
+        );
 
         client.engine.release_application_data();
+
+        // Save the session so the caller can offer it on reconnect.
+        if let Some(store) = client.engine.config().session_store() {
+            if let (Some(id), Some(ms_bytes)) = (
+                client.session_id.as_ref().filter(|id| !id.is_empty()),
+                client.engine.crypto_context().master_secret_bytes(),
+            ) {
+                let suite = client
+                    .engine
+                    .cipher_suite()
+                    .expect("cipher suite must be set after a completed handshake");
+                match MasterSecret::new(ms_bytes) {
+                    Ok(master_secret) => {
+                        let entry = Arc::new(StoredSession {
+                            master_secret,
+                            cipher_suite: suite,
+                        });
+                        store.store(id, entry);
+                        debug!("Session stored (id={:02x?})", &**id);
+                    }
+                    Err(e) => {
+                        warn!("Failed to create MasterSecret for session store: {}", e);
+                    }
+                }
+            }
+        }
 
         debug!("Handshake complete; ready for application data");
 
         Ok(Self::AwaitApplicationData)
     }
+
+    // ── Abbreviated handshake handlers (RFC 5246 §7.3) ────────────────────
+
+    fn await_abbreviated_change_cipher_spec(
+        self,
+        client: &mut Client,
+    ) -> Result<Self, InternalError> {
+        trace!("Abbreviated handshake: waiting for server ChangeCipherSpec");
+
+        let maybe = client.engine.next_record(ContentType::ChangeCipherSpec);
+
+        let Some(_) = maybe else {
+            return Ok(self);
+        };
+
+        client.engine.drop_pending_ccs();
+
+        // Arm server→client decryption so the server's Finished (epoch 1) can
+        // be parsed. Keys were derived in await_server_hello when the session
+        // match was detected.
+        trace!("Abbreviated: received server CCS; enabling peer encryption");
+        client.engine.enable_peer_encryption()?;
+
+        Ok(Self::AwaitAbbreviatedFinished)
+    }
+
+    fn await_abbreviated_finished(self, client: &mut Client) -> Result<Self, InternalError> {
+        trace!("Abbreviated handshake: waiting for server Finished");
+
+        // Compute expected verify_data before consuming the message.
+        let expected = client.engine.generate_verify_data(false /* server */)?;
+
+        let maybe = client
+            .engine
+            .next_handshake(MessageType::Finished, &mut client.defragment_buffer)?;
+
+        if maybe.is_none() {
+            return Ok(self);
+        }
+
+        let verify_data_range = if let Some(ref handshake) = maybe {
+            if let Body::Finished(finished) = &handshake.body {
+                finished.verify_data_range.clone()
+            } else {
+                panic!("Finished message should have been parsed");
+            }
+        } else {
+            unreachable!()
+        };
+        drop(maybe);
+
+        let verify_data = &client.defragment_buffer[verify_data_range];
+        let is_eq: bool = verify_data.ct_eq(expected.as_slice()).into();
+        if !is_eq {
+            return Err(Error::SecurityError(
+                crate::SecurityError::ServerFinishedVerificationFailed,
+            )
+            .into());
+        }
+
+        trace!("Server Finished (abbreviated) verified successfully");
+
+        // Server's final flight acked; stop resend timers for our previous
+        // flight (the ClientHello).
+        client.engine.flight_stop_resend_timers();
+
+        Ok(Self::SendAbbreviatedChangeCipherSpec)
+    }
+
+    fn send_abbreviated_change_cipher_spec(
+        self,
+        client: &mut Client,
+    ) -> Result<Self, InternalError> {
+        trace!("Abbreviated handshake: sending client ChangeCipherSpec");
+
+        // Note: keys already derived in await_server_hello; no derive_keys() call here.
+        client
+            .engine
+            .create_record(ContentType::ChangeCipherSpec, 0, true, |body| {
+                body.push(1);
+            })?;
+
+        Ok(Self::SendAbbreviatedFinished)
+    }
+
+    fn send_abbreviated_finished(self, client: &mut Client) -> Result<Self, InternalError> {
+        trace!("Abbreviated handshake: sending client Finished");
+
+        client
+            .engine
+            .create_handshake(MessageType::Finished, |body, engine| {
+                let verify_data = engine.generate_verify_data(true /* client */)?;
+                body.extend_from_slice(&verify_data);
+                Ok(())
+            })?;
+
+        // Handshake complete
+        debug!("Abbreviated handshake complete; ready for application data");
+        client.local_events.push_back(LocalEvent::Connected);
+
+        if let Some(cid) = client.engine.inbound_cid() {
+            client
+                .local_events
+                .push_back(LocalEvent::ConnectionId(cid.to_vec()));
+        }
+
+        emit_srtp_keying_material(
+            &mut client.engine,
+            &mut client.local_events,
+            client.negotiated_srtp_profile,
+        );
+
+        client.engine.release_application_data();
+
+        Ok(Self::AwaitApplicationData)
+    }
+
+    // ── End of abbreviated handshake handlers ─────────────────────────────
 
     fn await_application_data(self, client: &mut Client) -> Result<Self, InternalError> {
         if client.engine.close_notify_received() {
@@ -1311,6 +1501,95 @@ impl State {
         }
 
         Ok(self)
+    }
+}
+
+/// Restore the cached master secret and re-derive traffic keys for an
+/// abbreviated (session resumption) handshake.
+///
+/// Called from `await_server_hello` when the server echoes the offered
+/// `session_id`. Must be called before `enable_peer_encryption` so the
+/// server→client cipher is ready to decrypt the server's Finished message.
+fn derive_abbreviated_keys(
+    client: &mut Client,
+    cipher_suite: Dtls12CipherSuite,
+    session: &StoredSession,
+) -> Result<(), Error> {
+    let Some(server_random) = &client.server_random else {
+        return Err(Error::InvalidState(
+            crate::InvalidStateError::NoServerRandom,
+        ));
+    };
+
+    let mut client_random_buf = Buf::new();
+    let mut server_random_buf = Buf::new();
+    // unwrap: is ok because we set the random in handle_timeout / lazily
+    client.random.unwrap().serialize(&mut client_random_buf);
+    server_random.serialize(&mut server_random_buf);
+
+    let mut out = client.engine.pop_buffer();
+    let mut scratch = client.engine.pop_buffer();
+
+    client
+        .engine
+        .crypto_context_mut()
+        .restore_master_secret(session.master_secret.as_bytes())
+        .map_err(Error::CryptoError)?;
+
+    client
+        .engine
+        .crypto_context_mut()
+        .derive_keys(
+            cipher_suite,
+            &client_random_buf,
+            &server_random_buf,
+            &mut out,
+            &mut scratch,
+        )
+        .map_err(Error::CryptoError)?;
+
+    client.engine.push_buffer(out);
+    client.engine.push_buffer(scratch);
+
+    Ok(())
+}
+
+/// Extract SRTP keying material and push a `KeyingMaterial` local event if a
+/// profile was negotiated.
+///
+/// Shared by the full-handshake path (`await_finished` / `send_finished`) and
+/// the abbreviated-handshake path (`send_abbreviated_finished`) on both the
+/// client and server sides.  `server.rs` imports this as
+/// `use crate::dtls12::client::emit_srtp_keying_material`.
+pub(super) fn emit_srtp_keying_material(
+    engine: &mut Engine,
+    local_events: &mut VecDeque<LocalEvent>,
+    negotiated_srtp_profile: Option<SrtpProfile>,
+) {
+    let Some(profile) = negotiated_srtp_profile else {
+        return;
+    };
+    // unwrap: cipher suite must be set by the time we reach handshake completion.
+    let suite_hash = engine.cipher_suite().unwrap().hash_algorithm();
+    let mut out = engine.pop_buffer();
+    let mut scratch = engine.pop_buffer();
+    if let Ok(keying_material) = engine.crypto_context().extract_srtp_keying_material(
+        profile,
+        suite_hash,
+        &mut out,
+        &mut scratch,
+    ) {
+        engine.push_buffer(out);
+        engine.push_buffer(scratch);
+        debug!(
+            "SRTP keying material extracted ({} bytes) for profile: {:?}",
+            keying_material.len(),
+            profile
+        );
+        local_events.push_back(LocalEvent::KeyingMaterial(keying_material, profile));
+    } else {
+        engine.push_buffer(out);
+        engine.push_buffer(scratch);
     }
 }
 

@@ -217,6 +217,40 @@ impl CryptoContext {
         Ok(())
     }
 
+    /// Restore a master secret saved from a previous full handshake.
+    ///
+    /// Used by the abbreviated (session resumption) handshake path to skip the
+    /// `derive_extended_master_secret` step. The caller immediately follows
+    /// this with [`derive_keys`] to re-derive traffic keys from the stored
+    /// master secret and the new handshake randoms.
+    ///
+    /// Returns `Err` if `bytes` is not exactly 48 bytes.
+    ///
+    /// [`derive_keys`]: Self::derive_keys
+    pub fn restore_master_secret(&mut self, bytes: &[u8]) -> Result<(), CryptoError> {
+        if bytes.len() != 48 {
+            return Err(CryptoError::InvalidMasterSecretLength(bytes.len()));
+        }
+        let mut master_secret = ArrayVec::new();
+        master_secret
+            .try_extend_from_slice(bytes)
+            .map_err(|_| CryptoError::InvalidMasterSecretLength(bytes.len()))?;
+        self.master_secret = Some(master_secret);
+        self.pre_master_secret = None;
+        Ok(())
+    }
+
+    /// Return the raw master secret bytes, if available.
+    ///
+    /// Non-`None` after [`derive_extended_master_secret`] or
+    /// [`restore_master_secret`] has been called. Used by the session-store
+    /// layer to persist the master secret for future abbreviated handshakes.
+    ///
+    /// [`derive_extended_master_secret`]: Self::derive_extended_master_secret
+    pub fn master_secret_bytes(&self) -> Option<&[u8]> {
+        self.master_secret.as_deref()
+    }
+
     /// Derive master secret using Extended Master Secret (RFC 7627)
     pub fn derive_extended_master_secret(
         &mut self,
